@@ -1,193 +1,109 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+VERSION="7.1.0"
+
 # ============================================================
-#                 MOBILE CDN FILTER
-# ============================================================
-#
-# Universal mobile-network filter for NGINX.
-#
-# Supported infrastructure:
-#
-#   VK Cloud
-#   Yandex Cloud
-#   Beeline Cloud
-#   CDN Video
-#   Turboflare
-#   Beget
-#   Timeweb
-#   Selectel
-#   and any other CDN / VPS / proxy infrastructure
-#   where NGINX handles HTTP/HTTPS traffic.
+# MOBILE CDN FILTER
+# Universal installer for Nginx
 #
 # Modes:
+#   1) Native Nginx
+#   2) Nginx in Docker
 #
-#   1. Native NGINX
-#   2. NGINX inside Docker
+# Designed for CDN/proxy setups such as:
+# VK Cloud, Yandex Cloud, Beeline Cloud, CDN Video,
+# Turboflare, Beget, Timeweb, Selectel, etc.
 #
-# The installer DOES NOT require a specific nginx config layout.
-#
-# It:
-#
-#   - runs nginx -T
-#   - parses loaded server blocks
-#   - finds proxy locations
-#   - lets the user select the target server/location
-#   - creates backups
-#   - installs the mobile IP database separately
-#   - injects only the filter into the selected location
-#   - runs nginx -t
-#   - reloads only after successful validation
-#
-# Caddy is NOT supported.
-#
-# Version: 5.0.0
-#
-# ============================================================
-
-VERSION="5.0.0"
-
-# ============================================================
-# COLORS
+# Caddy is not supported.
 # ============================================================
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
+BLUE='\033[0;34m'
 WHITE='\033[1;37m'
 GRAY='\033[0;90m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ============================================================
-# PATHS
-# ============================================================
-
 BASE_DIR="/etc/mobile-filter"
-
 CUSTOM_ASNS="${BASE_DIR}/custom-asns.conf"
 CUSTOM_IPS="${BASE_DIR}/custom-ips.conf"
-
-INSTALLATION_CONF="${BASE_DIR}/installation.conf"
+STATE_FILE="${BASE_DIR}/installation.conf"
 
 MOBILE_RANGES="/etc/nginx/mobile-ranges.conf"
-FILTER_CONF="/etc/nginx/conf.d/mobile-filter.conf"
+FILTER_FILE="/etc/nginx/conf.d/mobile-filter.generated.conf"
 
 UPDATE_SCRIPT="/usr/local/bin/update-mobile-ranges.sh"
 MANAGER_SCRIPT="/usr/local/bin/mobile-filter"
-
 CRON_FILE="/etc/cron.d/mobile-filter"
+UPDATE_LOG="/var/log/mobile-filter-update.log"
 
-LOG_FILE="/var/log/mobile-filter-update.log"
-
-# ============================================================
-# RUNTIME
-# ============================================================
+FILTER_VAR="mobile_cdn_filter_allowed"
+FILTER_MARKER="# MOBILE-CDN-FILTER"
 
 MODE=""
-
 DOCKER_CONTAINER=""
-
 NGINX_CONFIG=""
-NGINX_DUMP=""
-
 TARGET_SERVER=""
+TARGET_SERVER_DISPLAY=""
 TARGET_LOCATION=""
-
+TARGET_SERVER_NO=""
 IP_SOURCE=""
 
-BACKUP_FILE=""
+NGINX_DUMP_FILE=""
+BACKUP_TARGET=""
+BACKUP_MAIN=""
+BACKUP_RANGES=""
+FILTER_CREATED=0
+
+ok()    { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()  { echo -e "  ${YELLOW}⚠${NC} $1"; }
+error() { echo -e "  ${RED}✘${NC} $1"; }
+info()  { echo -e "  ${CYAN}➜${NC} $1"; }
+die()   { error "$1"; exit 1; }
+
+header() {
+    echo
+    echo -e "${BOLD}${CYAN}$1${NC}"
+    echo -e "${GRAY}────────────────────────────────────────────────────────────${NC}"
+}
+
+cleanup() {
+    [[ -n "${NGINX_DUMP_FILE:-}" ]] &&
+        rm -f "$NGINX_DUMP_FILE" 2>/dev/null || true
+}
+
+trap cleanup EXIT
 
 # ============================================================
-# FILTER VARIABLES
-# ============================================================
-
-FILTER_VARIABLE="mobile_filter_allowed"
-CLIENT_IP_VARIABLE="mobile_filter_client_ip"
-
-# ============================================================
-# MOBILE ASN LIST
-#
-# The supplied mobile ASN pool.
-#
-# AS12389 is intentionally NOT included here.
-#
-# Rostelecom is handled through explicit static networks.
+# Built-in mobile ASN pool
+# AS12389 is intentionally excluded.
 # ============================================================
 
 BASE_MOBILE_ASN=(
-    # MTS
     8359
-
-    # Beeline / VimpelCom
-    3216
-    16345
-    42842
-
-    # MegaFon
-    31133
-    47395
-    35298
-    31224
-    31213
-    31208
-    31205
-    31195
-    31163
-    25159
-
-    # T2
-    12958
-    15378
-    42437
-    48092
-    48190
-    41330
-    39374
-
-    # Miranda
+    3216 16345 42842
+    31133 47395 35298 31224 31213 31208 31205 31195 31163 25159
+    12958 15378 42437 48092 48190 41330 39374
     201776
-
-    # Sberbank-Telecom
     206673
-
-    # Sevastar
     35816
-
-    # T-mobile + Alfa-mobile
-    205638
-    214257
-    202498
-
-    # Volna-Mobile
-    203451
-    203561
-
-    # MCS
+    205638 214257 202498
+    203451 203561
     47204
-
-    # MOTIV
     31499
-
-    # Phoenix
-    214721
-    204108
-
-    # Sevtelecom
-    59833
-    47203
+    214721 204108
+    59833 47203
 )
 
 # ============================================================
-# ROSTELECOM STATIC NETWORKS
-#
-# AS12389 is NOT part of the full ASN pool.
+# Static IPv4 ranges
 # ============================================================
 
-ROSTELECOM_IPS=(
+STATIC_IPS=(
     "5.141.100.0/22"
     "5.141.192.0/22"
     "5.142.40.0/21"
@@ -220,64 +136,15 @@ ROSTELECOM_IPS=(
     "212.120.169.0/24"
     "213.24.147.0/24"
     "217.107.106.0/24"
-)
-
-# ============================================================
-# OTHER STATIC NETWORKS
-# ============================================================
-
-EXTRA_OPERATOR_IPS=(
     "5.101.18.0/24"
     "91.107.97.0/24"
     "84.18.108.0/24"
 )
 
-# ============================================================
-# UI
-# ============================================================
-
-clear_screen() {
-    clear 2>/dev/null || true
-}
-
-line() {
-    echo -e "${GRAY}────────────────────────────────────────────────────────────${NC}"
-}
-
-header() {
-    echo
-    echo -e "${BOLD}${CYAN}$1${NC}"
-    line
-}
-
-ok() {
-    echo -e "  ${GREEN}✓${NC} $1"
-}
-
-warn() {
-    echo -e "  ${YELLOW}⚠${NC} $1"
-}
-
-error() {
-    echo -e "  ${RED}✘${NC} $1"
-}
-
-info() {
-    echo -e "  ${CYAN}➜${NC} $1"
-}
-
-pause_screen() {
-    echo
-    read -r -p "  Нажмите Enter для продолжения..." _
-}
-
 banner() {
-
-    clear_screen
-
+    clear 2>/dev/null || true
     echo -e "${CYAN}"
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║                                                            ║"
     echo "║                 MOBILE CDN FILTER                         ║"
     echo "║                                                            ║"
     echo "║        Universal NGINX Mobile Network Filter              ║"
@@ -287,533 +154,335 @@ banner() {
     echo "║                                                            ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
-
     echo -e "${GRAY}Version ${VERSION}${NC}"
-    echo
 }
-
-# ============================================================
-# ROOT
-# ============================================================
 
 check_root() {
-
-    if [[ "$EUID" -ne 0 ]]; then
-
-        error "Скрипт необходимо запускать от root."
-
-        echo
-        echo "Пример:"
-        echo
-        echo "  sudo bash $0"
-        echo
-
-        exit 1
-    fi
+    [[ "$EUID" -eq 0 ]] || die "Запустите установщик от root."
 }
 
-# ============================================================
-# BASE DIRECTORY
-# ============================================================
-
-prepare_directories() {
-
+init_files() {
     mkdir -p "$BASE_DIR"
-
-    touch "$CUSTOM_ASNS"
-    touch "$CUSTOM_IPS"
-
-    chmod 600 "$CUSTOM_ASNS"
-    chmod 600 "$CUSTOM_IPS"
+    touch "$CUSTOM_ASNS" "$CUSTOM_IPS"
+    chmod 600 "$CUSTOM_ASNS" "$CUSTOM_IPS"
 }
-
-# ============================================================
-# DEPENDENCIES
-# ============================================================
-
-install_dependencies() {
-
-    header "ПРОВЕРКА ЗАВИСИМОСТЕЙ"
-
-    local missing=()
-
-    command -v curl >/dev/null 2>&1 || missing+=("curl")
-    command -v python3 >/dev/null 2>&1 || missing+=("python3")
-
-    if [[ "$MODE" == "native" ]]; then
-        command -v nginx >/dev/null 2>&1 || missing+=("nginx")
-    fi
-
-    if [[ "$MODE" == "docker" ]]; then
-        command -v docker >/dev/null 2>&1 || missing+=("docker")
-    fi
-
-    if [[ ${#missing[@]} -eq 0 ]]; then
-
-        ok "Все зависимости установлены"
-        echo
-
-        return
-    fi
-
-    info "Не хватает: ${missing[*]}"
-    echo
-
-    if ! command -v apt-get >/dev/null 2>&1; then
-
-        error "apt-get не найден."
-
-        echo
-        echo "Установите вручную:"
-        echo "  ${missing[*]}"
-        echo
-
-        exit 1
-    fi
-
-    apt-get update -qq
-    apt-get install -y -qq "${missing[@]}"
-
-    ok "Зависимости установлены"
-    echo
-}
-
-# ============================================================
-# SELECT MODE
-# ============================================================
 
 select_mode() {
-
     header "РЕЖИМ NGINX"
 
     echo
-    echo -e "  ${WHITE}1${NC}) ${GREEN}Обычный Nginx${NC}"
-    echo -e "     Nginx установлен непосредственно на сервере"
-    echo
-
-    echo -e "  ${WHITE}2${NC}) ${BLUE}Nginx в Docker${NC}"
-    echo -e "     Nginx работает внутри Docker-контейнера"
-    echo
-
-    line
+    echo "  1) Обычный Nginx"
+    echo "  2) Nginx в Docker"
     echo
 
     local choice
 
     while true; do
-
         read -r -p "  Выберите [1-2]: " choice
 
         case "$choice" in
-
             1)
-
                 MODE="native"
                 break
                 ;;
-
             2)
-
                 MODE="docker"
+                read -r -p \
+                    "  Имя контейнера [cdn-nginx]: " DOCKER_CONTAINER
+                DOCKER_CONTAINER="${DOCKER_CONTAINER:-cdn-nginx}"
                 break
                 ;;
-
             *)
-
                 error "Введите 1 или 2."
                 ;;
-
         esac
-
     done
 
     echo
 
     if [[ "$MODE" == "native" ]]; then
-
-        ok "Выбран обычный Nginx"
-
+        ok "Обычный Nginx"
     else
-
-        ok "Выбран Docker Nginx"
-
-        echo
-
-        read -r -p \
-            "  Имя контейнера [cdn-nginx]: " container
-
-        DOCKER_CONTAINER="${container:-cdn-nginx}"
-
+        ok "Docker: ${DOCKER_CONTAINER}"
     fi
-
-    echo
 }
 
-# ============================================================
-# DOCKER CHECK
-# ============================================================
+install_dependencies() {
+    header "ПРОВЕРКА ЗАВИСИМОСТЕЙ"
 
-check_docker_container() {
+    local missing=()
 
-    [[ "$MODE" == "docker" ]] || return
+    command -v curl >/dev/null 2>&1 || missing+=(curl)
+    command -v python3 >/dev/null 2>&1 || missing+=(python3)
 
-    header "ПРОВЕРКА DOCKER-КОНТЕЙНЕРА"
-
-    if ! docker ps --format '{{.Names}}' |
-        grep -Fxq "$DOCKER_CONTAINER"; then
-
-        error "Контейнер '${DOCKER_CONTAINER}' не найден или не запущен."
-
-        echo
-        echo "Запущенные контейнеры:"
-        echo
-
-        docker ps --format \
-            '  {{.Names}}\t{{.Image}}\t{{.Status}}'
-
-        echo
-
-        exit 1
+    if [[ "$MODE" == "native" ]] &&
+       ! command -v nginx >/dev/null 2>&1
+    then
+        missing+=(nginx)
     fi
+
+    if [[ "$MODE" == "docker" ]] &&
+       ! command -v docker >/dev/null 2>&1
+    then
+        missing+=(docker)
+    fi
+
+    if (( ${#missing[@]} == 0 )); then
+        ok "Все зависимости установлены"
+        return 0
+    fi
+
+    command -v apt-get >/dev/null 2>&1 ||
+        die "Не найдены: ${missing[*]} и apt-get недоступен."
+
+    info "Устанавливаем: ${missing[*]}"
+    apt-get update -qq
+    apt-get install -y -qq "${missing[@]}"
+    ok "Зависимости установлены"
+}
+
+check_docker() {
+    [[ "$MODE" == "docker" ]] || return 0
+
+    header "ПРОВЕРКА DOCKER"
+
+    docker info >/dev/null 2>&1 ||
+        die "Docker недоступен."
+
+    docker ps --format '{{.Names}}' |
+        grep -Fxq "$DOCKER_CONTAINER" ||
+        die "Контейнер '${DOCKER_CONTAINER}' не запущен."
 
     ok "Контейнер найден: ${DOCKER_CONTAINER}"
-    echo
 }
-
-# ============================================================
-# NGINX DUMP
-# ============================================================
-
-get_nginx_dump() {
-
-    if [[ "$MODE" == "docker" ]]; then
-
-        docker exec "$DOCKER_CONTAINER" nginx -T 2>&1
-
-    else
-
-        nginx -T 2>&1
-
-    fi
-}
-
-# ============================================================
-# NGINX TEST
-# ============================================================
 
 nginx_test() {
-
     if [[ "$MODE" == "docker" ]]; then
-
         docker exec "$DOCKER_CONTAINER" nginx -t
-
     else
-
         nginx -t
-
     fi
 }
-
-# ============================================================
-# NGINX RELOAD
-# ============================================================
 
 nginx_reload() {
-
     if [[ "$MODE" == "docker" ]]; then
-
         docker exec "$DOCKER_CONTAINER" nginx -s reload
-
     else
-
         nginx -s reload
-
     fi
 }
 
-# ============================================================
-# GET NGINX VERSION
-# ============================================================
-
-show_nginx_info() {
-
-    header "NGINX"
+save_nginx_dump() {
+    NGINX_DUMP_FILE="$(mktemp)"
 
     if [[ "$MODE" == "docker" ]]; then
-
-        docker exec "$DOCKER_CONTAINER" nginx -v 2>&1
-
+        docker exec "$DOCKER_CONTAINER" nginx -T \
+            >"$NGINX_DUMP_FILE" 2>&1
     else
-
-        nginx -v 2>&1
-
+        nginx -T >"$NGINX_DUMP_FILE" 2>&1
     fi
-
-    echo
 }
 
 # ============================================================
-# PARSE NGINX CONFIG
+# nginx -T parser
 #
-# We use nginx -T instead of assuming:
-#
-#   /etc/nginx/sites-enabled/default
-#
-# or:
-#
-#   /etc/nginx/conf.d/default.conf
-#
-# Nginx itself outputs configuration-file markers in -T.
+# Output:
+# SERVER|number|file|names|listen
+# LOCATION|server_number|location_number|location|proxy_pass
 # ============================================================
 
 parse_targets() {
-
-    local dump="$1"
-
-    python3 - "$dump" <<'PY'
-import sys
+    python3 - "$1" <<'PY'
 import re
+import sys
 
-text = sys.argv[1]
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8", errors="replace") as f:
+    text = f.read()
 
 lines = text.splitlines()
-
 current_file = ""
 
+def block_from(lines, start, keyword):
+    clean = lines[start].split("#", 1)[0].rstrip()
+
+    if not re.match(
+        rf'^[ \t]*{re.escape(keyword)}[ \t]*\{{',
+        clean
+    ):
+        return None
+
+    depth = 0
+    result = []
+
+    for idx in range(start, len(lines)):
+        clean = re.sub(r'#.*$', '', lines[idx])
+        depth += clean.count("{")
+        depth -= clean.count("}")
+        result.append(lines[idx])
+
+        if idx > start and depth == 0:
+            return "\n".join(result)
+
+    return None
+
 servers = []
+i = 0
 
-server_start = None
-server_depth = 0
-server_lines = []
-server_file = ""
+while i < len(lines):
 
-for index, line in enumerate(lines):
-
-    # nginx -T file marker
     marker = re.match(
         r'^# configuration file (.+):$',
-        line
+        lines[i]
     )
 
     if marker:
         current_file = marker.group(1).strip()
 
-    stripped = line.strip()
+    clean = re.sub(r'#.*$', '', lines[i]).strip()
 
-    if server_start is None:
+    if re.match(r'^server\s*\{', clean):
 
-        if re.match(
-            r'^server\s*\{',
-            stripped
-        ):
+        block = block_from(lines, i, "server")
 
-            server_start = index
-            server_lines = [line]
-            server_file = current_file
+        if block:
 
-            server_depth = (
-                line.count("{") -
-                line.count("}")
-            )
+            names = []
+            listens = []
 
-            if server_depth == 0:
-
-                server_start = None
-                server_lines = []
-
-    else:
-
-        if index != server_start:
-            server_lines.append(line)
-
-        server_depth += (
-            line.count("{") -
-            line.count("}")
-        )
-
-        if server_depth == 0:
-
-            block = "\n".join(server_lines)
-
-            names = re.findall(
-                r'(?m)^\s*server_name\s+([^;]+);',
+            for m in re.finditer(
+                r'(?m)^[ \t]*server_name[ \t]+([^;]+);',
                 block
-            )
+            ):
+                names.extend(m.group(1).split())
 
-            listens = re.findall(
-                r'(?m)^\s*listen\s+([^;]+);',
+            for m in re.finditer(
+                r'(?m)^[ \t]*listen[ \t]+([^;]+);',
                 block
-            )
+            ):
+                listens.append(m.group(1).strip())
 
             locations = []
 
-            # ------------------------------------------------
-            # Find locations
-            # ------------------------------------------------
-
-            for loc_match in re.finditer(
-                r'(?m)^\s*location\s+([^{]+)\{',
+            for lm in re.finditer(
+                r'(?m)^[ \t]*location[ \t]+([^{]+)\{',
                 block
             ):
 
-                location_header = (
-                    loc_match.group(1).strip()
-                )
+                loc_header = lm.group(1).strip()
 
-                open_pos = block.find(
-                    "{",
-                    loc_match.start()
-                )
-
+                open_pos = block.find("{", lm.start())
                 depth = 0
                 close_pos = None
 
-                for pos in range(
+                for p in range(
                     open_pos,
                     len(block)
                 ):
 
-                    char = block[pos]
-
-                    if char == "{":
+                    if block[p] == "{":
                         depth += 1
 
-                    elif char == "}":
-
+                    elif block[p] == "}":
                         depth -= 1
 
                         if depth == 0:
-
-                            close_pos = pos
+                            close_pos = p + 1
                             break
 
                 if close_pos is None:
                     continue
 
-                location_block = block[
-                    loc_match.start():
-                    close_pos + 1
+                loc_block = block[
+                    lm.start():close_pos
                 ]
 
-                proxy_pass = re.findall(
-                    r'(?m)^\s*proxy_pass\s+([^;]+);',
-                    location_block
+                proxy = re.findall(
+                    r'(?m)^[ \t]*proxy_pass[ \t]+([^;]+);',
+                    loc_block
                 )
 
-                if proxy_pass:
-
+                if proxy:
                     locations.append(
                         (
-                            location_header,
-                            proxy_pass[0].strip()
+                            loc_header,
+                            proxy[0].strip()
                         )
                     )
 
             servers.append(
-                {
-                    "file": server_file,
-                    "names": names,
-                    "listens": listens,
-                    "locations": locations
-                }
+                (
+                    current_file,
+                    names,
+                    listens,
+                    locations
+                )
             )
 
-            server_start = None
-            server_lines = []
-            server_file = ""
+            depth = 0
 
-# ------------------------------------------------------------
-# Output
-# ------------------------------------------------------------
+            for j in range(i, len(lines)):
 
-for idx, server in enumerate(
-    servers,
-    1
-):
+                clean2 = re.sub(r'#.*$', '', lines[j])
+                depth += clean2.count("{")
+                depth -= clean2.count("}")
 
-    file = server["file"]
-    names = " ".join(server["names"])
-    listens = " ".join(server["listens"])
+                if j > i and depth == 0:
+                    i = j
+                    break
+
+    i += 1
+
+for snum, server in enumerate(servers, 1):
+
+    filename, names, listens, locations = server
 
     print(
         "SERVER|{}|{}|{}|{}".format(
-            idx,
-            file,
-            names,
-            listens
+            snum,
+            filename.replace("|", "/"),
+            " ".join(names).replace("|", "/"),
+            " ".join(listens).replace("|", "/")
         )
     )
 
-    for loc_idx, location in enumerate(
-        server["locations"],
+    for lnum, location in enumerate(
+        locations,
         1
     ):
 
-        header = (
-            location[0]
-            .replace("|", "/")
-        )
-
-        proxy = (
-            location[1]
-            .replace("|", "/")
-        )
-
         print(
             "LOCATION|{}|{}|{}|{}".format(
-                idx,
-                loc_idx,
-                header,
-                proxy
+                snum,
+                lnum,
+                location[0].replace("|", "/"),
+                location[1].replace("|", "/")
             )
         )
 PY
 }
 
 # ============================================================
-# SELECT SERVER
+# Server + location selection
 # ============================================================
 
-select_server() {
+select_target() {
+    header "АНАЛИЗ ТЕКУЩЕЙ КОНФИГУРАЦИИ"
 
-    header "АНАЛИЗ КОНФИГУРАЦИИ"
-
-    info "Выполняется nginx -T..."
-    echo
-
-    NGINX_DUMP="$(
-        get_nginx_dump
-    )"
-
-    if [[ -z "$NGINX_DUMP" ]]; then
-
-        error "Не удалось получить конфигурацию Nginx."
-        exit 1
-
-    fi
+    save_nginx_dump
 
     local parsed
+    parsed="$(parse_targets "$NGINX_DUMP_FILE")"
 
-    parsed="$(
-        parse_targets "$NGINX_DUMP"
-    )"
-
-    if [[ -z "$parsed" ]]; then
-
-        error "Server-блоки не найдены."
-        exit 1
-
-    fi
+    [[ -n "$parsed" ]] ||
+        die "Не найдено ни одного server-блока."
 
     declare -a SERVER_FILES
     declare -a SERVER_NAMES
     declare -a SERVER_LISTENS
 
     local count=0
-
-    echo
-    echo -e "${BOLD}Найденные server-блоки:${NC}"
-    echo
 
     while IFS='|' read -r \
         type \
@@ -829,45 +498,27 @@ select_server() {
         SERVER_NAMES[$count]="$names"
         SERVER_LISTENS[$count]="$listens"
 
-        echo -e \
-            "  ${WHITE}$((count + 1))${NC})"
-
-        echo -e \
-            "     server_name: ${CYAN}${names:-_}${NC}"
-
-        echo -e \
-            "     listen:      ${CYAN}${listens:-_}${NC}"
-
-        echo -e \
-            "     config:      ${GRAY}${file}${NC}"
-
         echo
+        echo -e "  ${WHITE}$((count + 1))${NC}"
+        echo "     server_name: ${names:-_}"
+        echo "     listen:      ${listens:-_}"
+        echo -e "     config:      ${GRAY}${file}${NC}"
 
         count=$((count + 1))
 
     done <<< "$parsed"
 
-    if (( count == 0 )); then
+    (( count > 0 )) ||
+        die "Server-блоки не найдены."
 
-        error "Подходящих server-блоков не найдено."
-        exit 1
-
-    fi
-
-    local choice=""
-
-    # --------------------------------------------------------
-    # Automatic selection when only one server exists.
-    # --------------------------------------------------------
+    local choice
 
     if (( count == 1 )); then
-
-        echo -e \
-            "${GREEN}Найден только один server — он будет выбран.${NC}"
 
         choice=1
 
         echo
+        ok "Единственный server выбран автоматически."
 
     else
 
@@ -877,54 +528,32 @@ select_server() {
                 "  Выберите server [1-${count}]: " choice
 
             if [[ "$choice" =~ ^[0-9]+$ ]] &&
-                (( choice >= 1 && choice <= count )); then
-
+               (( choice >= 1 && choice <= count ))
+            then
                 break
-
             fi
 
             error "Неверный выбор."
-
         done
 
     fi
 
-    local selected=$((choice - 1))
+    local idx=$((choice - 1))
 
-    TARGET_SERVER="${SERVER_NAMES[$selected]}"
-    NGINX_CONFIG="${SERVER_FILES[$selected]}"
-
-    echo
-
-    ok "Server: ${TARGET_SERVER:-_}"
-    ok "Config: ${NGINX_CONFIG}"
+    TARGET_SERVER_DISPLAY="${SERVER_NAMES[$idx]}"
+    TARGET_SERVER="${SERVER_NAMES[$idx]%% *}"
+    TARGET_FILE="${SERVER_FILES[$idx]}"
+    TARGET_SERVER_NO="$choice"
+    NGINX_CONFIG="$TARGET_FILE"
 
     echo
-
-    # Save server number for location selection.
-    SELECTED_SERVER_NUMBER="$choice"
-}
-
-# ============================================================
-# SELECT LOCATION
-# ============================================================
-
-select_location() {
-
-    header "ВЫБОР LOCATION"
-
-    local parsed
-
-    parsed="$(
-        parse_targets "$NGINX_DUMP"
-    )"
+    ok "Server: ${TARGET_SERVER_DISPLAY:-_}"
+    ok "Config: ${TARGET_FILE}"
 
     declare -a LOC_NAMES
     declare -a LOC_PROXIES
 
-    local count=0
-
-    echo
+    local location_count=0
 
     while IFS='|' read -r \
         type \
@@ -935,67 +564,46 @@ select_location() {
     do
 
         [[ "$type" == "LOCATION" ]] || continue
+        [[ "$server_number" == "$TARGET_SERVER_NO" ]] || continue
 
-        [[ "$server_number" == "$SELECTED_SERVER_NUMBER" ]] || continue
-
-        LOC_NAMES[$count]="$location"
-        LOC_PROXIES[$count]="$proxy"
-
-        echo -e \
-            "  ${WHITE}$((count + 1))${NC})"
-
-        echo -e \
-            "     location: ${CYAN}${location}${NC}"
-
-        echo -e \
-            "     proxy:    ${CYAN}${proxy}${NC}"
+        LOC_NAMES[$location_count]="$location"
+        LOC_PROXIES[$location_count]="$proxy"
 
         echo
+        echo -e \
+            "  ${WHITE}$((location_count + 1))${NC}) ${location}"
 
-        count=$((count + 1))
+        echo -e \
+            "     proxy_pass: ${proxy}"
+
+        location_count=$((location_count + 1))
 
     done <<< "$parsed"
 
-    if (( count == 0 )); then
+    (( location_count > 0 )) ||
+        die "В выбранном server нет location с proxy_pass."
 
-        warn "В выбранном server не найден location с proxy_pass."
-
-        echo
-        echo "Фильтр предназначен для проксируемого трафика."
-        echo "Автоматическое внедрение отменено."
-        echo
-
-        exit 1
-
-    fi
-
-    local choice=""
-
-    if (( count == 1 )); then
-
-        echo -e \
-            "${GREEN}Найден только один proxy location — он будет выбран.${NC}"
+    if (( location_count == 1 )); then
 
         choice=1
 
         echo
+        ok "Единственный proxy location выбран автоматически."
 
     else
 
         while true; do
 
             read -r -p \
-                "  Выберите location [1-${count}]: " choice
+                "  Выберите location [1-${location_count}]: " choice
 
             if [[ "$choice" =~ ^[0-9]+$ ]] &&
-                (( choice >= 1 && choice <= count )); then
-
+               (( choice >= 1 && choice <= location_count ))
+            then
                 break
-
             fi
 
             error "Неверный выбор."
-
         done
 
     fi
@@ -1003,36 +611,22 @@ select_location() {
     TARGET_LOCATION="${LOC_NAMES[$((choice - 1))]}"
 
     echo
-
     ok "Location: ${TARGET_LOCATION}"
     ok "Proxy:    ${LOC_PROXIES[$((choice - 1))]}"
-
-    echo
 }
 
 # ============================================================
-# IP SOURCE
+# IP source
 # ============================================================
 
 select_ip_source() {
-
     header "ИСТОЧНИК IP КЛИЕНТА"
 
     echo
-    echo "Фильтру необходимо знать реальный IPv4 клиента."
-    echo
-    echo -e \
-        "  ${WHITE}1${NC}) X-Real-IP"
-
-    echo -e \
-        "  ${WHITE}2${NC}) Первый IP из X-Forwarded-For"
-
-    echo -e \
-        "  ${WHITE}3${NC}) $remote_addr"
-
-    echo -e \
-        "  ${WHITE}4${NC}) Автоматически"
-
+    echo "  1) X-Real-IP"
+    echo "  2) Первый IP X-Forwarded-For"
+    echo "  3) remote_addr"
+    echo "  4) Автоматически"
     echo
 
     local choice
@@ -1045,36 +639,11 @@ select_ip_source() {
         choice="${choice:-4}"
 
         case "$choice" in
-
-            1)
-
-                IP_SOURCE="x_real_ip"
-                break
-                ;;
-
-            2)
-
-                IP_SOURCE="x_forwarded_for"
-                break
-                ;;
-
-            3)
-
-                IP_SOURCE="remote_addr"
-                break
-                ;;
-
-            4)
-
-                IP_SOURCE="auto"
-                break
-                ;;
-
-            *)
-
-                error "Введите 1, 2, 3 или 4."
-                ;;
-
+            1) IP_SOURCE="x_real_ip"; break ;;
+            2) IP_SOURCE="xff"; break ;;
+            3) IP_SOURCE="remote"; break ;;
+            4) IP_SOURCE="auto"; break ;;
+            *) error "Введите 1-4." ;;
         esac
 
     done
@@ -1082,74 +651,59 @@ select_ip_source() {
     echo
 
     case "$IP_SOURCE" in
-
         x_real_ip)
-            ok "IP source: X-Real-IP"
+            ok "X-Real-IP"
             ;;
-
-        x_forwarded_for)
-            ok "IP source: первый IP X-Forwarded-For"
+        xff)
+            ok "Первый IP X-Forwarded-For"
             ;;
-
-        remote_addr)
-            ok "IP source: remote_addr"
+        remote)
+            ok "remote_addr"
             ;;
-
         auto)
-            ok "IP source: automatic"
+            ok "X-Forwarded-For → remote_addr"
             ;;
-
     esac
-
-    echo
 }
 
 # ============================================================
-# CUSTOM USER DATA
+# User custom IP / ASN
 # ============================================================
 
 valid_ipv4_or_cidr() {
-
-    local value="$1"
-
-    python3 - "$value" <<'PY'
-import sys
+    python3 - "$1" <<'PY'
 import ipaddress
-
-value = sys.argv[1]
+import sys
 
 try:
-    network = ipaddress.ip_network(
-        value,
+    net = ipaddress.ip_network(
+        sys.argv[1],
         strict=False
     )
 
-    if network.version != 4:
+    if net.version != 4:
         raise ValueError
 
 except Exception:
-    sys.exit(1)
+    raise SystemExit(1)
 
-sys.exit(0)
+raise SystemExit(0)
 PY
 }
 
-add_initial_custom_data() {
-
-    header "ВАШИ IP И ASN"
+ask_custom() {
+    header "СОБСТВЕННЫЕ IP И ASN"
 
     echo
-    echo "Если хотите разрешить собственный IP"
-    echo "или добавить собственный мобильный ASN,"
-    echo "можно сделать это сейчас."
+    echo "Можно добавить свои IP/CIDR и ASN."
+    echo "Они сохранятся и не удалятся при автообновлении."
     echo
 
     read -r -p \
-        "  Добавить свои IP/CIDR сейчас? [y/N]: " answer
+        "  Добавить свои IP/CIDR? [y/N]: " answer
 
     if [[ "$answer" =~ ^[Yy]$ ]]; then
 
-        echo
         read -r -p \
             "  IP/CIDR через пробел: " values
 
@@ -1159,11 +713,12 @@ add_initial_custom_data() {
 
                 echo "$value" >> "$CUSTOM_IPS"
 
-                ok "Добавлен: $value"
+                ok "Добавлен IP: $value"
 
             else
 
-                warn "Некорректный IPv4/CIDR: $value"
+                warn \
+                    "Некорректный IPv4/CIDR: $value"
 
             fi
 
@@ -1174,11 +729,10 @@ add_initial_custom_data() {
     echo
 
     read -r -p \
-        "  Добавить свои ASN сейчас? [y/N]: " answer
+        "  Добавить свои ASN? [y/N]: " answer
 
     if [[ "$answer" =~ ^[Yy]$ ]]; then
 
-        echo
         read -r -p \
             "  ASN через пробел: " values
 
@@ -1203,351 +757,126 @@ add_initial_custom_data() {
 
     fi
 
-    sort -u "$CUSTOM_IPS" \
-        -o "$CUSTOM_IPS"
-
-    sort -nu "$CUSTOM_ASNS" \
-        -o "$CUSTOM_ASNS"
-
-    echo
-}
-
-# ============================================================
-# ADD BUILT-IN STATIC IP NETWORKS
-# ============================================================
-
-install_static_networks() {
-
-    header "STATIC NETWORKS"
-
-    for IP in "${ROSTELECOM_IPS[@]}"; do
-
+    for IP in "${STATIC_IPS[@]}"; do
         echo "$IP" >> "$CUSTOM_IPS"
-
     done
 
-    for IP in "${EXTRA_OPERATOR_IPS[@]}"; do
-
-        echo "$IP" >> "$CUSTOM_IPS"
-
-    done
-
-    sort -u "$CUSTOM_IPS" \
-        -o "$CUSTOM_IPS"
-
-    ok \
-        "Добавлены Rostelecom CIDR: ${#ROSTELECOM_IPS[@]}"
-
-    ok \
-        "Добавлены дополнительные CIDR: ${#EXTRA_OPERATOR_IPS[@]}"
-
-    echo
+    sort -u "$CUSTOM_IPS" -o "$CUSTOM_IPS"
+    sort -nu "$CUSTOM_ASNS" -o "$CUSTOM_ASNS"
 }
 
 # ============================================================
-# BUILD ASN LIST
+# Backup
 # ============================================================
 
-build_asn_list() {
+backup_current() {
+    header "BACKUP"
 
-    local output="$1"
+    local ts
+    ts="$(date +%Y%m%d-%H%M%S)"
 
-    : > "$output"
-
-    for ASN in "${BASE_MOBILE_ASN[@]}"; do
-
-        echo "$ASN" >> "$output"
-
-    done
-
-    if [[ -f "$CUSTOM_ASNS" ]]; then
-
-        while IFS= read -r ASN; do
-
-            ASN="$(echo "$ASN" |
-                tr -d '[:space:]')"
-
-            [[ -z "$ASN" ]] && continue
-
-            [[ "$ASN" =~ ^# ]] && continue
-
-            ASN="${ASN#AS}"
-            ASN="${ASN#as}"
-
-            if [[ "$ASN" =~ ^[0-9]+$ ]]; then
-
-                echo "$ASN" >> "$output"
-
-            fi
-
-        done < "$CUSTOM_ASNS"
-
-    fi
-
-    sort -nu "$output" \
-        -o "$output"
-}
-
-# ============================================================
-# GENERATE PREFIX DATABASE
-# ============================================================
-
-generate_ranges() {
-
-    header "ПОЛУЧЕНИЕ IP-ДИАПАЗОНОВ"
-
-    local output
-
-    output="$(mktemp)"
-
-    local asn_file
-
-    asn_file="$(mktemp)"
-
-    local count_file
-
-    count_file="$(mktemp)"
-
-    trap \
-        'rm -f "$output" "$asn_file" "$count_file"' \
-        RETURN
-
-    build_asn_list "$asn_file"
-
-    echo
-    echo "ASN в пуле: $(wc -l < "$asn_file")"
-    echo
-    echo "Запрос announced IPv4 prefixes через RIPE..."
-    echo
-
-    while IFS= read -r ASN; do
-
-        [[ -z "$ASN" ]] && continue
-
-        echo -n \
-            "  AS${ASN} ... "
-
-        : > "$count_file"
-
-        curl -fsS \
-            --max-time 30 \
-            "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${ASN}" |
-        python3 -c '
-import sys
-import json
-
-try:
-
-    data = json.load(sys.stdin)
-
-    prefixes = data.get(
-        "data",
-        {}
-    ).get(
-        "prefixes",
-        []
-    )
-
-    count = 0
-
-    for item in prefixes:
-
-        prefix = item.get(
-            "prefix",
-            ""
-        ).strip()
-
-        if prefix and ":" not in prefix:
-
-            print(
-                prefix + " 1;"
-            )
-
-            count += 1
-
-    print(
-        count,
-        file=sys.stderr
-    )
-
-except Exception:
-
-    print(
-        0,
-        file=sys.stderr
-    )
-' 2>"$count_file" \
-        >> "$output" || true
-
-        local count
-
-        count="$(
-            cat "$count_file" 2>/dev/null ||
-            echo 0
-        )"
-
-        echo \
-            "${count} IPv4 prefixes"
-
-        sleep 0.15
-
-    done < "$asn_file"
-
-    echo
-    echo "Добавление статических IP/CIDR..."
-
-    while IFS= read -r IP; do
-
-        IP="$(echo "$IP" | xargs 2>/dev/null || true)"
-
-        [[ -z "$IP" ]] && continue
-        [[ "$IP" =~ ^# ]] && continue
-
-        echo \
-            "${IP} 1;" \
-            >> "$output"
-
-    done < "$CUSTOM_IPS"
-
-    sort -u "$output" \
-        -o "$output"
-
-    echo
-    echo "Всего IPv4 prefixes: $(wc -l < "$output")"
-    echo
-
-    install_ranges "$output"
-
-    rm -f \
-        "$output" \
-        "$asn_file" \
-        "$count_file"
-
-    trap - RETURN
-}
-
-# ============================================================
-# INSTALL RANGES
-# ============================================================
-
-install_ranges() {
-
-    local source="$1"
+    BACKUP_TARGET="${TARGET_FILE}.mobile-filter-backup.${ts}"
 
     if [[ "$MODE" == "docker" ]]; then
 
         docker exec "$DOCKER_CONTAINER" \
-            mkdir -p /etc/nginx
+            cp "$TARGET_FILE" "$BACKUP_TARGET"
 
-        docker exec -i "$DOCKER_CONTAINER" \
-            sh -c \
-            'cat > /etc/nginx/mobile-ranges.conf' \
-            < "$source"
+        if docker exec "$DOCKER_CONTAINER" \
+            test -f "$MOBILE_RANGES"
+        then
 
-        ok \
-            "mobile-ranges.conf загружен в Docker"
+            BACKUP_RANGES="${MOBILE_RANGES}.mobile-filter-backup.${ts}"
+
+            docker exec "$DOCKER_CONTAINER" \
+                cp "$MOBILE_RANGES" "$BACKUP_RANGES"
+
+        fi
 
     else
 
-        mkdir -p \
-            "$(dirname "$MOBILE_RANGES")"
+        [[ -f "$TARGET_FILE" ]] ||
+            die "Целевой конфиг не найден: $TARGET_FILE"
 
-        install -m 0644 \
-            "$source" \
-            "$MOBILE_RANGES"
+        cp -a "$TARGET_FILE" "$BACKUP_TARGET"
 
-        ok \
-            "mobile-ranges.conf установлен"
+        if [[ -f "$MOBILE_RANGES" ]]; then
+
+            BACKUP_RANGES="${MOBILE_RANGES}.mobile-filter-backup.${ts}"
+
+            cp -a "$MOBILE_RANGES" "$BACKUP_RANGES"
+
+        fi
 
     fi
+
+    ok "Backup создан"
 }
 
 # ============================================================
-# CREATE FILTER INCLUDE
+# Filter config
 # ============================================================
 
-create_filter_config() {
+create_filter_file() {
+    header "СОЗДАНИЕ FILTER"
 
-    header "СОЗДАНИЕ ФИЛЬТРА"
-
-    local temp
-
-    temp="$(mktemp)"
+    local tmp
+    tmp="$(mktemp)"
 
     case "$IP_SOURCE" in
 
         x_real_ip)
 
-            cat > "$temp" <<EOF
-# ============================================================
-# Mobile CDN Filter
-# Generated by mobile-filter ${VERSION}
-# ============================================================
-
-geo \$http_x_real_ip \$mobile_filter_allowed {
+            cat > "$tmp" <<EOF
+${FILTER_MARKER}
+geo \$http_x_real_ip ${FILTER_VAR} {
     default 0;
     include /etc/nginx/mobile-ranges.conf;
 }
 EOF
-
             ;;
 
-        x_forwarded_for)
+        xff)
 
-            cat > "$temp" <<EOF
-# ============================================================
-# Mobile CDN Filter
-# Generated by mobile-filter ${VERSION}
-# ============================================================
-
-map \$http_x_forwarded_for \$mobile_filter_client_ip {
+            cat > "$tmp" <<EOF
+${FILTER_MARKER}
+map \$http_x_forwarded_for mobile_cdn_client_ip {
     default \$remote_addr;
-    "~^(?<mobile_filter_first_ip>[^, ]+)" \$mobile_filter_first_ip;
+    "~^(?<mobile_cdn_first_ip>[^, ]+)" \$mobile_cdn_first_ip;
 }
 
-geo \$mobile_filter_client_ip \$mobile_filter_allowed {
+geo \$mobile_cdn_client_ip ${FILTER_VAR} {
     default 0;
     include /etc/nginx/mobile-ranges.conf;
 }
 EOF
-
             ;;
 
-        remote_addr)
+        remote)
 
-            cat > "$temp" <<EOF
-# ============================================================
-# Mobile CDN Filter
-# Generated by mobile-filter ${VERSION}
-# ============================================================
-
-geo \$remote_addr \$mobile_filter_allowed {
+            cat > "$tmp" <<EOF
+${FILTER_MARKER}
+geo \$remote_addr ${FILTER_VAR} {
     default 0;
     include /etc/nginx/mobile-ranges.conf;
 }
 EOF
-
             ;;
 
         auto)
 
-            cat > "$temp" <<EOF
-# ============================================================
-# Mobile CDN Filter
-# Generated by mobile-filter ${VERSION}
-# ============================================================
-
-map \$http_x_forwarded_for \$mobile_filter_client_ip {
+            cat > "$tmp" <<EOF
+${FILTER_MARKER}
+map \$http_x_forwarded_for mobile_cdn_client_ip {
     default \$remote_addr;
-    "~^(?<mobile_filter_first_ip>[^, ]+)" \$mobile_filter_first_ip;
+    "~^(?<mobile_cdn_first_ip>[^, ]+)" \$mobile_cdn_first_ip;
 }
 
-geo \$mobile_filter_client_ip \$mobile_filter_allowed {
+geo \$mobile_cdn_client_ip ${FILTER_VAR} {
     default 0;
     include /etc/nginx/mobile-ranges.conf;
 }
 EOF
-
             ;;
 
     esac
@@ -1557,901 +886,783 @@ EOF
         docker exec "$DOCKER_CONTAINER" \
             mkdir -p /etc/nginx/conf.d
 
-        docker cp \
-            "$temp" \
-            "${DOCKER_CONTAINER}:${FILTER_CONF}"
+        if docker exec "$DOCKER_CONTAINER" \
+            test -e "$FILTER_FILE"
+        then
 
-        ok \
-            "Фильтр загружен в Docker"
+            if ! docker exec "$DOCKER_CONTAINER" \
+                grep -qF "$FILTER_MARKER" "$FILTER_FILE"
+            then
 
-    else
+                rm -f "$tmp"
 
-        mkdir -p \
-            /etc/nginx/conf.d
+                die \
+                    "Файл ${FILTER_FILE} уже используется."
 
-        if [[ -f "$FILTER_CONF" ]]; then
+            fi
 
-            cp -a \
-                "$FILTER_CONF" \
-                "${FILTER_CONF}.backup.$(
-                    date +%Y%m%d-%H%M%S
-                )"
+            FILTER_CREATED=0
+
+        else
+
+            docker cp "$tmp" \
+                "${DOCKER_CONTAINER}:${FILTER_FILE}"
+
+            FILTER_CREATED=1
 
         fi
 
-        install -m 0644 \
-            "$temp" \
-            "$FILTER_CONF"
+    else
 
-        ok \
-            "Фильтр установлен в ${FILTER_CONF}"
+        mkdir -p /etc/nginx/conf.d
+
+        if [[ -e "$FILTER_FILE" ]] &&
+           ! grep -qF "$FILTER_MARKER" "$FILTER_FILE"
+        then
+
+            rm -f "$tmp"
+
+            die \
+                "Файл ${FILTER_FILE} уже используется."
+
+        fi
+
+        if [[ ! -e "$FILTER_FILE" ]]; then
+
+            install -m 0644 \
+                "$tmp" \
+                "$FILTER_FILE"
+
+            FILTER_CREATED=1
+
+        fi
 
     fi
 
-    rm -f "$temp"
+    rm -f "$tmp"
 
-    echo
+    ok "Filter: ${FILTER_FILE}"
 }
 
 # ============================================================
-# CHECK CONF.D INCLUDE
+# Include filter into http {}
 # ============================================================
 
-check_filter_include() {
+ensure_filter_include() {
+    header "ПОДКЛЮЧЕНИЕ FILTER"
 
-    header "ПРОВЕРКА INCLUDE"
+    local main="/etc/nginx/nginx.conf"
 
     if [[ "$MODE" == "docker" ]]; then
 
         local dump
+        local tmp
 
-        dump="$(
-            docker exec \
-                "$DOCKER_CONTAINER" \
-                nginx -T 2>&1
+        dump="$(mktemp)"
+
+        docker exec "$DOCKER_CONTAINER" \
+            nginx -T >"$dump" 2>&1 || true
+
+        if grep -qF "$FILTER_FILE" "$dump"; then
+
+            rm -f "$dump"
+
+            ok "Filter уже подключён"
+
+            return 0
+
+        fi
+
+        if grep -qE \
+            'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' \
+            "$dump"
+        then
+
+            rm -f "$dump"
+
+            ok \
+                "Docker Nginx подключает conf.d/*.conf"
+
+            return 0
+
+        fi
+
+        rm -f "$dump"
+
+        tmp="$(mktemp)"
+
+        docker exec "$DOCKER_CONTAINER" \
+            cat "$main" > "$tmp"
+
+        python3 - "$tmp" "$FILTER_FILE" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+include = sys.argv[2]
+
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+
+if include in text:
+    raise SystemExit(0)
+
+m = re.search(
+    r"(?m)^[ \t]*http[ \t]*\{",
+    text
+)
+
+if not m:
+    raise SystemExit(2)
+
+pos = text.find(
+    "{",
+    m.start()
+)
+
+text = (
+    text[:pos + 1] +
+    f"\n    include {include};\n" +
+    text[pos + 1:]
+)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+PY
+
+        local ts
+        ts="$(date +%Y%m%d-%H%M%S)"
+
+        BACKUP_MAIN="${main}.mobile-filter-backup.${ts}"
+
+        docker exec "$DOCKER_CONTAINER" \
+            cp "$main" "$BACKUP_MAIN"
+
+        docker cp "$tmp" \
+            "${DOCKER_CONTAINER}:${main}"
+
+        rm -f "$tmp"
+
+        ok "Include добавлен в Docker nginx.conf"
+
+    else
+
+        if grep -qF "$FILTER_FILE" "$main"; then
+
+            ok "Filter уже подключён"
+
+            return 0
+
+        fi
+
+        if grep -qE \
+            'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' \
+            "$main"
+        then
+
+            ok "Nginx подключает conf.d/*.conf"
+
+            return 0
+
+        fi
+
+        local backup
+
+        backup="${main}.mobile-filter-backup.$(
+            date +%Y%m%d-%H%M%S
         )"
 
-        if echo "$dump" |
-            grep -qE \
-            'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;'
-        then
+        cp -a "$main" "$backup"
 
-            ok \
-                "Docker Nginx подключает /etc/nginx/conf.d/*.conf"
+        python3 - "$main" "$FILTER_FILE" <<'PY'
+import re
+import sys
 
-            return
+path = sys.argv[1]
+include = sys.argv[2]
 
-        fi
+with open(path, encoding="utf-8") as f:
+    text = f.read()
 
-        if echo "$dump" |
-            grep -q \
-            "mobile-filter.conf"
-        then
+if include in text:
+    raise SystemExit(0)
 
-            ok \
-                "mobile-filter.conf уже загружен"
+m = re.search(
+    r"(?m)^[ \t]*http[ \t]*\{",
+    text
+)
 
-            return
+if not m:
+    raise SystemExit(2)
 
-        fi
+pos = text.find(
+    "{",
+    m.start()
+)
 
-        error \
-            "Не найден include для /etc/nginx/conf.d/*.conf."
+text = (
+    text[:pos + 1] +
+    f"\n    include {include};\n" +
+    text[pos + 1:]
+)
 
-        echo
-        echo "Автоматическая модификация main nginx.conf"
-        echo "отменена для безопасности."
-        echo
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+PY
 
-        exit 1
+        BACKUP_MAIN="$backup"
 
+        ok "Include добавлен в nginx.conf"
     fi
-
-    local main_conf
-
-    main_conf="/etc/nginx/nginx.conf"
-
-    if grep -qE \
-        'include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' \
-        "$main_conf"
-    then
-
-        ok \
-            "Основной Nginx подключает conf.d/*.conf"
-
-        return
-
-    fi
-
-    if grep -qE \
-        'include[[:space:]]+conf\.d/\*\.conf;' \
-        "$main_conf"
-    then
-
-        ok \
-            "Основной Nginx подключает conf.d/*.conf"
-
-        return
-
-    fi
-
-    warn \
-        "Стандартный include conf.d не найден."
-
-    echo
-    echo "Найденные include:"
-    echo
-
-    grep -n \
-        "include" \
-        "$main_conf" \
-        || true
-
-    echo
-
-    error \
-        "Автоматическая установка остановлена."
-
-    echo
-    echo "Существующий nginx.conf не изменён."
-    echo
-
-    exit 1
 }
 
 # ============================================================
-# PATCH NATIVE CONFIG
-#
-# Only the selected location is modified.
+# Generate whitelist
 # ============================================================
 
-patch_config_file() {
+generate_ranges() {
+    header "ОБНОВЛЕНИЕ MOBILE RANGES"
 
-    local file="$1"
-    local server_name="$2"
-    local location_name="$3"
+    local asn_file
+    local output
+    local count_file
 
-    python3 \
-        - "$file" "$server_name" "$location_name" <<'PY'
+    asn_file="$(mktemp)"
+    output="$(mktemp)"
+    count_file="$(mktemp)"
 
+    printf '%s\n' \
+        "${BASE_MOBILE_ASN[@]}" \
+        > "$asn_file"
+
+    while IFS= read -r ASN; do
+
+        ASN="$(echo "$ASN" | tr -d '[:space:]')"
+
+        [[ -z "$ASN" ]] && continue
+        [[ "$ASN" =~ ^# ]] && continue
+
+        ASN="${ASN#AS}"
+        ASN="${ASN#as}"
+
+        if [[ "$ASN" =~ ^[0-9]+$ ]]; then
+            echo "$ASN" >> "$asn_file"
+        fi
+
+    done < "$CUSTOM_ASNS"
+
+    sort -nu "$asn_file" -o "$asn_file"
+
+    local total_asn
+    total_asn="$(wc -l < "$asn_file")"
+
+    echo
+    echo "ASN в пуле: ${total_asn}"
+    echo
+
+    while IFS= read -r ASN; do
+
+        echo -n "  AS${ASN} ... "
+
+        : > "$count_file"
+
+        if curl -fsS \
+            --max-time 30 \
+            "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${ASN}" |
+        python3 -c '
+import json
 import sys
+
+try:
+    data = json.load(sys.stdin)
+    prefixes = data.get("data", {}).get("prefixes", [])
+    count = 0
+
+    for item in prefixes:
+        p = item.get("prefix", "").strip()
+
+        if p and ":" not in p:
+            print(p + " 1;")
+            count += 1
+
+    print(count, file=sys.stderr)
+
+except Exception:
+    print(0, file=sys.stderr)
+' 2>"$count_file" >> "$output"
+        then
+            echo \
+                "$(cat "$count_file" 2>/dev/null || echo 0) prefixes"
+        else
+            echo "ERROR"
+        fi
+
+        sleep 0.12
+
+    done < "$asn_file"
+
+    echo
+    echo "Добавление static/custom IP..."
+
+    while IFS= read -r IP; do
+
+        IP="$(echo "$IP" | xargs 2>/dev/null || true)"
+
+        [[ -z "$IP" ]] && continue
+        [[ "$IP" =~ ^# ]] && continue
+
+        echo "${IP} 1;" >> "$output"
+
+    done < "$CUSTOM_IPS"
+
+    sort -u "$output" -o "$output"
+
+    local total
+    total="$(wc -l < "$output")"
+
+    echo
+    echo "Итого IPv4 prefixes: ${total}"
+
+    (( total > 0 )) ||
+        die "Whitelist пуст."
+
+    if [[ "$MODE" == "docker" ]]; then
+
+        docker exec -i "$DOCKER_CONTAINER" \
+            sh -c \
+            'cat > /etc/nginx/mobile-ranges.conf' \
+            < "$output"
+
+    else
+
+        install -m 0644 \
+            "$output" \
+            "$MOBILE_RANGES"
+
+    fi
+
+    rm -f \
+        "$asn_file" \
+        "$output" \
+        "$count_file"
+
+    ok "Mobile ranges установлены"
+}
+
+# ============================================================
+# Patch selected location
+# ============================================================
+
+patch_target() {
+    header "ВНЕДРЕНИЕ ФИЛЬТРА"
+
+    local tmp
+    tmp="$(mktemp)"
+
+    if [[ "$MODE" == "docker" ]]; then
+
+        docker exec "$DOCKER_CONTAINER" \
+            cat "$TARGET_FILE" > "$tmp"
+
+    else
+
+        cp "$TARGET_FILE" "$tmp"
+
+    fi
+
+    local result
+
+    result="$(
+        python3 \
+            - "$tmp" "$TARGET_SERVER" "$TARGET_LOCATION" <<'PY'
 import re
-import shutil
-from datetime import datetime
+import sys
 
 path = sys.argv[1]
-server_name = sys.argv[2]
-location_name = sys.argv[3]
+wanted_server = sys.argv[2]
+wanted_location = sys.argv[3]
 
-# ------------------------------------------------------------
-# Read
-# ------------------------------------------------------------
-
-with open(
-    path,
-    "r",
-    encoding="utf-8"
-) as f:
-
+with open(path, encoding="utf-8") as f:
     text = f.read()
 
-# ------------------------------------------------------------
-# Already installed
-# ------------------------------------------------------------
+servers = []
 
-if "mobile_filter_allowed" in text:
-
-    print("ALREADY_INSTALLED")
-    sys.exit(0)
-
-# ------------------------------------------------------------
-# Find server blocks
-# ------------------------------------------------------------
-
-def find_blocks(
-    text,
-    keyword
+for sm in re.finditer(
+    r"(?m)^[ \t]*server\b[^{]*\{",
+    text
 ):
 
-    result = []
-
-    pattern = re.compile(
-        r'(?m)^[ \t]*' +
-        re.escape(keyword) +
-        r'\b[^{]*\{'
-    )
-
-    for match in pattern.finditer(text):
-
-        start = match.start()
-
-        open_pos = text.find(
-            "{",
-            match.start()
-        )
-
-        depth = 0
-        end = None
-
-        for pos in range(
-            open_pos,
-            len(text)
-        ):
-
-            if text[pos] == "{":
-
-                depth += 1
-
-            elif text[pos] == "}":
-
-                depth -= 1
-
-                if depth == 0:
-
-                    end = pos + 1
-                    break
-
-        if end is not None:
-
-            result.append(
-                (
-                    start,
-                    end,
-                    text[start:end]
-                )
-            )
-
-    return result
-
-servers = find_blocks(
-    text,
-    "server"
-)
-
-selected_server = None
-
-# ------------------------------------------------------------
-# Select server
-# ------------------------------------------------------------
-
-for (
-    start,
-    end,
-    block
-) in servers:
-
-    names = re.findall(
-        r'(?m)^[ \t]*server_name[ \t]+([^;]+);',
-        block
-    )
-
-    joined = " ".join(
-        names
-    )
-
-    if server_name in joined:
-
-        selected_server = (
-            start,
-            end,
-            block
-        )
-
-        break
-
-if selected_server is None:
-
-    print(
-        "SERVER_NOT_FOUND"
-    )
-
-    sys.exit(2)
-
-server_start, server_end, server_block = (
-    selected_server
-)
-
-# ------------------------------------------------------------
-# Find locations
-# ------------------------------------------------------------
-
-locations = []
-
-pattern = re.compile(
-    r'(?m)^[ \t]*location[ \t]+([^{]+)\{'
-)
-
-for match in pattern.finditer(
-    server_block
-):
-
-    header = match.group(1).strip()
-
-    open_pos = server_block.find(
-        "{",
-        match.start()
-    )
+    ss = sm.start()
+    op = text.find("{", sm.start())
 
     depth = 0
-    end = None
+    se = None
 
-    for pos in range(
-        open_pos,
-        len(server_block)
-    ):
+    for i in range(op, len(text)):
 
-        if server_block[pos] == "{":
-
+        if text[i] == "{":
             depth += 1
 
-        elif server_block[pos] == "}":
+        elif text[i] == "}":
 
             depth -= 1
 
             if depth == 0:
-
-                end = pos + 1
+                se = i + 1
                 break
 
-    if end is None:
+    if se is None:
         continue
 
-    block = server_block[
-        match.start():
-        end
-    ]
+    block = text[ss:se]
 
-    locations.append(
-        (
-            match.start(),
-            end,
-            header,
-            block
+    names = []
+
+    for m in re.finditer(
+        r"(?m)^[ \t]*server_name[ \t]+([^;]+);",
+        block
+    ):
+        names.extend(m.group(1).split())
+
+    if wanted_server in names:
+        servers.append(
+            (
+                ss,
+                se,
+                block
+            )
         )
+
+if not servers:
+    print("NO_SERVER")
+    raise SystemExit(2)
+
+ss, se, server_block = servers[0]
+
+selected = None
+
+for lm in re.finditer(
+    r"(?m)^[ \t]*location[ \t]+([^{]+)\{",
+    server_block
+):
+
+    location = lm.group(1).strip()
+
+    if (
+        location != wanted_location
+        and wanted_location not in location
+    ):
+        continue
+
+    op = server_block.find(
+        "{",
+        lm.start()
     )
 
-# ------------------------------------------------------------
-# Select location
-# ------------------------------------------------------------
+    depth = 0
+    le = None
 
-selected_location = None
+    for i in range(
+        op,
+        len(server_block)
+    ):
 
-for item in locations:
+        if server_block[i] == "{":
+            depth += 1
 
-    if item[2].strip() == location_name.strip():
+        elif server_block[i] == "}":
 
-        selected_location = item
+            depth -= 1
+
+            if depth == 0:
+                le = i + 1
+                break
+
+    if le is not None:
+
+        selected = (
+            lm.start(),
+            le,
+            server_block[
+                lm.start():le
+            ]
+        )
+
         break
 
-if selected_location is None:
+if selected is None:
+    print("NO_LOCATION")
+    raise SystemExit(3)
 
-    for item in locations:
+ls, le, location_block = selected
 
-        if location_name.strip() in item[2]:
+if re.search(
+    r"(?m)^[ \t]*if[ \t]*\(\$mobile_cdn_filter_allowed[ \t]*=[ \t]*0\)",
+    location_block
+):
+    print("ALREADY")
+    raise SystemExit(0)
 
-            selected_location = item
-            break
-
-if selected_location is None:
-
-    print(
-        "LOCATION_NOT_FOUND"
-    )
-
-    sys.exit(3)
-
-loc_start, loc_end, loc_header, loc_block = (
-    selected_location
+proxy = re.search(
+    r"(?m)^([ \t]*)proxy_pass\b",
+    location_block
 )
 
-# ------------------------------------------------------------
-# Backup
-# ------------------------------------------------------------
-
-backup = (
-    path +
-    ".mobile-filter-backup." +
-    datetime.now().strftime(
-        "%Y%m%d-%H%M%S"
-    )
+indent = (
+    proxy.group(1)
+    if proxy
+    else "    "
 )
-
-shutil.copy2(
-    path,
-    backup
-)
-
-# ------------------------------------------------------------
-# Determine indentation
-# ------------------------------------------------------------
-
-proxy_match = re.search(
-    r'(?m)^([ \t]*)proxy_pass\b',
-    loc_block
-)
-
-if proxy_match:
-
-    indent = proxy_match.group(1)
-
-else:
-
-    indent = "    "
-
-# ------------------------------------------------------------
-# Filter block
-# ------------------------------------------------------------
 
 injection = (
     indent +
-    "if ($mobile_filter_allowed = 0) {\n" +
+    "if ($mobile_cdn_filter_allowed = 0) {\n" +
     indent +
     "    return 403;\n" +
     indent +
     "}\n\n"
 )
 
-# ------------------------------------------------------------
-# Inject before proxy_pass
-# ------------------------------------------------------------
-
-if proxy_match:
+if proxy:
 
     new_location = (
-        loc_block[
-            :proxy_match.start()
-        ] +
+        location_block[:proxy.start()] +
         injection +
-        loc_block[
-            proxy_match.start():
-        ]
+        location_block[proxy.start():]
     )
 
 else:
 
-    open_pos = loc_block.find(
-        "{"
-    )
+    p = location_block.find("{")
 
     new_location = (
-        loc_block[
-            :open_pos + 1
-        ] +
+        location_block[:p + 1] +
         "\n" +
         injection +
-        loc_block[
-            open_pos + 1:
-        ]
+        location_block[p + 1:]
     )
 
-# ------------------------------------------------------------
-# Rebuild
-# ------------------------------------------------------------
-
 new_server = (
-    server_block[
-        :loc_start
-    ] +
+    server_block[:ls] +
     new_location +
-    server_block[
-        loc_end:
-    ]
+    server_block[le:]
 )
 
 new_text = (
-    text[
-        :server_start
-    ] +
+    text[:ss] +
     new_server +
-    text[
-        server_end:
-    ]
+    text[se:]
 )
 
-# ------------------------------------------------------------
-# Write
-# ------------------------------------------------------------
+with open(path, "w", encoding="utf-8") as f:
+    f.write(new_text)
 
-with open(
-    path,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    f.write(
-        new_text
-    )
-
-print(
-    "PATCHED"
-)
-
-print(
-    "BACKUP=" + backup
-)
+print("PATCHED")
 PY
-}
-
-# ============================================================
-# PATCH NATIVE
-# ============================================================
-
-patch_native() {
-
-    header "ВНЕДРЕНИЕ В NGINX"
-
-    local result
-
-    result="$(
-        patch_config_file \
-            "$NGINX_CONFIG" \
-            "$TARGET_SERVER" \
-            "$TARGET_LOCATION"
     )"
 
-    echo "$result"
+    if grep -q "^ALREADY$" <<< "$result"; then
 
-    if echo "$result" |
-        grep -q "^ALREADY_INSTALLED"
-    then
+        rm -f "$tmp"
 
-        warn \
-            "Фильтр уже установлен."
+        ok "Фильтр уже установлен"
 
-        return
+        return 0
+    fi
+
+    if ! grep -q "^PATCHED$" <<< "$result"; then
+
+        rm -f "$tmp"
+
+        die "Не удалось внедрить фильтр."
 
     fi
 
-    if ! echo "$result" |
-        grep -q "^PATCHED"
-    then
+    if [[ "$MODE" == "docker" ]]; then
 
-        error \
-            "Не удалось изменить Nginx config."
-
-        exit 1
-
-    fi
-
-    BACKUP_FILE="$(
-        echo "$result" |
-        sed -n 's/^BACKUP=//p'
-    )"
-
-    ok \
-        "Изменён только выбранный location"
-
-    echo
-
-    info \
-        "Backup: ${BACKUP_FILE}"
-
-    echo
-}
-
-# ============================================================
-# PATCH DOCKER
-# ============================================================
-
-patch_docker() {
-
-    header "ВНЕДРЕНИЕ В DOCKER NGINX"
-
-    local temp
-
-    temp="$(mktemp)"
-
-    docker exec \
-        "$DOCKER_CONTAINER" \
-        cat "$NGINX_CONFIG" \
-        > "$temp"
-
-    local result
-
-    result="$(
-        patch_config_file \
-            "$temp" \
-            "$TARGET_SERVER" \
-            "$TARGET_LOCATION"
-    )"
-
-    echo "$result"
-
-    if echo "$result" |
-        grep -q "^ALREADY_INSTALLED"
-    then
-
-        rm -f "$temp"
-
-        warn \
-            "Фильтр уже установлен."
-
-        return
-
-    fi
-
-    if ! echo "$result" |
-        grep -q "^PATCHED"
-    then
-
-        rm -f "$temp"
-
-        error \
-            "Не удалось изменить Docker config."
-
-        exit 1
-
-    fi
-
-    # --------------------------------------------------------
-    # Create backup inside container
-    # --------------------------------------------------------
-
-    local timestamp
-
-    timestamp="$(
-        date +%Y%m%d-%H%M%S
-    )"
-
-    docker exec \
-        "$DOCKER_CONTAINER" \
-        cp \
-        "$NGINX_CONFIG" \
-        "${NGINX_CONFIG}.mobile-filter-backup.${timestamp}"
-
-    # --------------------------------------------------------
-    # Upload modified file
-    # --------------------------------------------------------
-
-    docker cp \
-        "$temp" \
-        "${DOCKER_CONTAINER}:${NGINX_CONFIG}"
-
-    rm -f "$temp"
-
-    BACKUP_FILE="${NGINX_CONFIG}.mobile-filter-backup.${timestamp}"
-
-    ok \
-        "Изменён только выбранный location"
-
-    ok \
-        "Backup внутри контейнера создан"
-
-    echo
-}
-
-# ============================================================
-# VALIDATE
-# ============================================================
-
-validate_config() {
-
-    header "ПРОВЕРКА КОНФИГУРАЦИИ"
-
-    echo
-
-    if nginx_test; then
-
-        echo
-        ok "nginx -t: OK"
+        docker cp \
+            "$tmp" \
+            "${DOCKER_CONTAINER}:${TARGET_FILE}"
 
     else
 
-        echo
-
-        error \
-            "nginx -t: ERROR"
-
-        echo
-
-        warn \
-            "Reload НЕ выполняется."
-
-        exit 1
+        cp "$tmp" "$TARGET_FILE"
 
     fi
 
-    echo
+    rm -f "$tmp"
+
+    ok "Фильтр внедрён"
 }
 
 # ============================================================
-# RELOAD
+# Rollback
 # ============================================================
 
-reload_nginx() {
+rollback() {
+    warn "Выполняется rollback..."
 
-    header "RELOAD"
+    if [[ "$MODE" == "docker" ]]; then
 
-    nginx_reload
+        if [[ -n "${BACKUP_TARGET:-}" ]]; then
 
-    ok "Nginx успешно перезагружен"
+            docker exec "$DOCKER_CONTAINER" \
+                cp "$BACKUP_TARGET" "$TARGET_FILE" \
+                >/dev/null 2>&1 || true
 
-    echo
+        fi
+
+        if [[ -n "${BACKUP_MAIN:-}" ]]; then
+
+            docker exec "$DOCKER_CONTAINER" \
+                cp "$BACKUP_MAIN" /etc/nginx/nginx.conf \
+                >/dev/null 2>&1 || true
+
+        fi
+
+        if [[ -n "${BACKUP_RANGES:-}" ]]; then
+
+            docker exec "$DOCKER_CONTAINER" \
+                cp "$BACKUP_RANGES" "$MOBILE_RANGES" \
+                >/dev/null 2>&1 || true
+
+        fi
+
+    else
+
+        if [[ -n "${BACKUP_TARGET:-}" &&
+              -f "$BACKUP_TARGET" ]]
+        then
+            cp -a "$BACKUP_TARGET" "$TARGET_FILE"
+        fi
+
+        if [[ -n "${BACKUP_MAIN:-}" &&
+              -f "$BACKUP_MAIN" ]]
+        then
+            cp -a "$BACKUP_MAIN" /etc/nginx/nginx.conf
+        fi
+
+        if [[ -n "${BACKUP_RANGES:-}" &&
+              -f "$BACKUP_RANGES" ]]
+        then
+            cp -a "$BACKUP_RANGES" "$MOBILE_RANGES"
+        fi
+
+    fi
+
+    if (( FILTER_CREATED == 1 )); then
+
+        if [[ "$MODE" == "docker" ]]; then
+
+            docker exec "$DOCKER_CONTAINER" \
+                rm -f "$FILTER_FILE" \
+                >/dev/null 2>&1 || true
+
+        else
+
+            rm -f "$FILTER_FILE" || true
+
+        fi
+
+    fi
+
+    ok "Rollback завершён"
 }
 
 # ============================================================
-# CREATE UPDATE SCRIPT
+# Helper scripts
 # ============================================================
 
-create_update_script() {
+create_helpers() {
 
-    header "СОЗДАНИЕ ОБНОВЛЯТОРА"
+    header "СОЗДАНИЕ УПРАВЛЕНИЯ"
 
-    cat > "$UPDATE_SCRIPT" <<'EOF'
+    cat > "$UPDATE_SCRIPT" <<'UPDATER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-BASE_DIR="/etc/mobile-filter"
+BASE="/etc/mobile-filter"
 
-CUSTOM_ASNS="${BASE_DIR}/custom-asns.conf"
-CUSTOM_IPS="${BASE_DIR}/custom-ips.conf"
+ASN_FILE="${BASE}/custom-asns.conf"
+IP_FILE="${BASE}/custom-ips.conf"
+STATE="${BASE}/installation.conf"
 
-MOBILE_RANGES="/etc/nginx/mobile-ranges.conf"
+RANGES="/etc/nginx/mobile-ranges.conf"
 
-INSTALLATION_CONF="${BASE_DIR}/installation.conf"
-
-TMP="$(mktemp)"
-ASN_FILE="$(mktemp)"
-COUNT_FILE="$(mktemp)"
-
-cleanup() {
-
-    rm -f \
-        "$TMP" \
-        "$ASN_FILE" \
-        "$COUNT_FILE"
-
-}
-
-trap cleanup EXIT
-
-mkdir -p "$BASE_DIR"
-
-touch "$CUSTOM_ASNS"
-touch "$CUSTOM_IPS"
-
-# ============================================================
-# BASE ASN
-# ============================================================
-
-MOBILE_ASN=(
+ASN=(
     8359
-
-    3216
-    16345
-    42842
-
-    31133
-    47395
-    35298
-    31224
-    31213
-    31208
-    31205
-    31195
-    31163
-    25159
-
-    12958
-    15378
-    42437
-    48092
-    48190
-    41330
-    39374
-
-    201776
-    206673
-
-    35816
-
-    205638
-    214257
-    202498
-
-    203451
-    203561
-
+    3216 16345 42842
+    31133 47395 35298 31224 31213 31208 31205 31195 31163 25159
+    12958 15378 42437 48092 48190 41330 39374
+    201776 206673 35816
+    205638 214257 202498
+    203451 203561
     47204
-
     31499
-
-    214721
-    204108
-
-    59833
-    47203
+    214721 204108
+    59833 47203
 )
 
-# ============================================================
-# CUSTOM ASN
-# ============================================================
+TMP="$(mktemp)"
+ASNS="$(mktemp)"
+COUNT="$(mktemp)"
 
-while IFS= read -r ASN; do
-
-    ASN="$(echo "$ASN" |
-        tr -d '[:space:]')"
-
-    [[ -z "$ASN" ]] && continue
-    [[ "$ASN" =~ ^# ]] && continue
-
-    ASN="${ASN#AS}"
-    ASN="${ASN#as}"
-
-    if [[ "$ASN" =~ ^[0-9]+$ ]]; then
-
-        MOBILE_ASN+=("$ASN")
-
-    fi
-
-done < "$CUSTOM_ASNS"
+trap 'rm -f "$TMP" "$ASNS" "$COUNT"' EXIT
 
 printf '%s\n' \
-    "${MOBILE_ASN[@]}" |
-    sort -nu \
-    > "$ASN_FILE"
+    "${ASN[@]}" \
+    > "$ASNS"
 
-# ============================================================
-# FETCH
-# ============================================================
+while IFS= read -r A; do
 
-echo
-echo "============================================================"
-echo " MOBILE CDN FILTER"
-echo " RANGE UPDATE"
-echo " $(date)"
-echo "============================================================"
-echo
+    A="$(echo "$A" | tr -d '[:space:]')"
 
-echo "ASN count: $(wc -l < "$ASN_FILE")"
-echo
+    [[ -z "$A" ]] && continue
+    [[ "$A" =~ ^# ]] && continue
 
-while IFS= read -r ASN; do
+    A="${A#AS}"
+    A="${A#as}"
 
-    [[ -z "$ASN" ]] && continue
+    [[ "$A" =~ ^[0-9]+$ ]] &&
+        echo "$A" >> "$ASNS"
 
-    echo -n "AS${ASN} ... "
+done < "$ASN_FILE"
 
-    : > "$COUNT_FILE"
+sort -nu "$ASNS" -o "$ASNS"
 
-    curl -fsS \
+while IFS= read -r A; do
+
+    echo -n "AS${A} ... "
+    : > "$COUNT"
+
+    if curl -fsS \
         --max-time 30 \
-        "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${ASN}" |
+        "https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${A}" |
     python3 -c '
-import sys
 import json
+import sys
 
 try:
-
     data = json.load(sys.stdin)
+    n = 0
 
-    prefixes = data.get(
-        "data",
-        {}
-    ).get(
-        "prefixes",
-        []
-    )
+    for item in data.get("data", {}).get("prefixes", []):
 
-    count = 0
-
-    for item in prefixes:
-
-        prefix = item.get(
+        p = item.get(
             "prefix",
             ""
         ).strip()
 
-        if prefix and ":" not in prefix:
+        if p and ":" not in p:
 
             print(
-                prefix + " 1;"
+                p + " 1;"
             )
 
-            count += 1
+            n += 1
 
     print(
-        count,
+        n,
         file=sys.stderr
     )
 
@@ -2461,27 +1672,25 @@ except Exception:
         0,
         file=sys.stderr
     )
-' 2>"$COUNT_FILE" \
-        >> "$TMP" || true
+' 2>"$COUNT" >> "$TMP"
+    then
 
-    echo \
-        "$(cat "$COUNT_FILE" 2>/dev/null || echo 0) prefixes"
+        echo \
+            "$(cat "$COUNT" 2>/dev/null || echo 0) prefixes"
 
-    sleep 0.15
+    else
 
-done < "$ASN_FILE"
+        echo "ERROR"
 
-# ============================================================
-# STATIC IP
-# ============================================================
+    fi
 
-echo
-echo "Adding custom/static IP ranges..."
+    sleep 0.12
+
+done < "$ASNS"
 
 while IFS= read -r IP; do
 
-    IP="$(echo "$IP" |
-        xargs 2>/dev/null || true)"
+    IP="$(echo "$IP" | xargs 2>/dev/null || true)"
 
     [[ -z "$IP" ]] && continue
     [[ "$IP" =~ ^# ]] && continue
@@ -2490,217 +1699,157 @@ while IFS= read -r IP; do
         "${IP} 1;" \
         >> "$TMP"
 
-done < "$CUSTOM_IPS"
+done < "$IP_FILE"
 
-sort -u "$TMP" \
-    -o "$TMP"
+sort -u "$TMP" -o "$TMP"
 
-echo
-echo "Final IPv4 prefixes:"
-echo "  $(wc -l < "$TMP")"
-echo
+COUNT_FINAL="$(wc -l < "$TMP")"
 
-# ============================================================
-# READ INSTALLATION
-# ============================================================
+if [[ "$COUNT_FINAL" -eq 0 ]]; then
 
-MODE="native"
-DOCKER_CONTAINER=""
+    echo "ERROR: whitelist is empty."
 
-if [[ -f "$INSTALLATION_CONF" ]]; then
-
-    # shellcheck disable=SC1090
-    source "$INSTALLATION_CONF"
-
+    exit 1
 fi
-
-# ============================================================
-# DOCKER
-# ============================================================
 
 if [[ "${MODE:-native}" == "docker" ]]; then
 
-    if ! command -v docker >/dev/null 2>&1; then
-
-        echo "ERROR: docker not found."
-        exit 1
-
-    fi
-
     if ! docker ps \
         --format '{{.Names}}' |
-        grep -Fxq "${DOCKER_CONTAINER}"
+        grep -Fxq "$DOCKER_CONTAINER"
     then
 
         echo \
             "ERROR: Docker container ${DOCKER_CONTAINER} is not running."
 
         exit 1
-
     fi
 
-    docker exec \
-        "$DOCKER_CONTAINER" \
-        mkdir -p /etc/nginx
-
-    docker exec -i \
-        "$DOCKER_CONTAINER" \
+    docker exec -i "$DOCKER_CONTAINER" \
         sh -c \
         'cat > /etc/nginx/mobile-ranges.conf' \
         < "$TMP"
 
-    docker exec \
-        "$DOCKER_CONTAINER" \
+    docker exec "$DOCKER_CONTAINER" \
         nginx -t
 
-    docker exec \
-        "$DOCKER_CONTAINER" \
+    docker exec "$DOCKER_CONTAINER" \
         nginx -s reload
 
-    echo
-    echo "Docker Nginx reloaded."
+else
 
-    exit 0
+    install -m 0644 \
+        "$TMP" \
+        "$RANGES"
+
+    nginx -t
+
+    nginx -s reload
+
 fi
 
-# ============================================================
-# NATIVE
-# ============================================================
-
-install -m 0644 \
-    "$TMP" \
-    "$MOBILE_RANGES"
-
-nginx -t
-
-nginx -s reload
-
 echo
-echo "Nginx reloaded."
-EOF
+echo "Updated: ${COUNT_FINAL} IPv4 prefixes."
+UPDATER
 
-    chmod +x "$UPDATE_SCRIPT"
+    chmod 755 "$UPDATE_SCRIPT"
 
-    ok \
-        "Создан ${UPDATE_SCRIPT}"
-
-    echo
-}
-
-# ============================================================
-# CREATE MANAGER
-# ============================================================
-
-create_manager() {
-
-    header "СОЗДАНИЕ MANAGER"
-
-    cat > "$MANAGER_SCRIPT" <<'EOF'
+    cat > "$MANAGER_SCRIPT" <<'MANAGER'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-BASE_DIR="/etc/mobile-filter"
+BASE="/etc/mobile-filter"
 
-CUSTOM_ASNS="${BASE_DIR}/custom-asns.conf"
-CUSTOM_IPS="${BASE_DIR}/custom-ips.conf"
+A="${BASE}/custom-asns.conf"
+I="${BASE}/custom-ips.conf"
 
-UPDATE_SCRIPT="/usr/local/bin/update-mobile-ranges.sh"
+U="/usr/local/bin/update-mobile-ranges.sh"
 
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-CYAN='\033[0;36m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+mkdir -p "$BASE"
 
-mkdir -p "$BASE_DIR"
-
-touch "$CUSTOM_ASNS"
-touch "$CUSTOM_IPS"
+touch "$A" "$I"
 
 pause() {
 
     echo
-    read -r -p "Нажмите Enter..." _
+
+    read -r -p \
+        "Нажмите Enter..." _
 
 }
 
-valid_ipv4_or_cidr() {
+valid_ip() {
 
     python3 - "$1" <<'PY'
-import sys
 import ipaddress
+import sys
 
 try:
 
-    net = ipaddress.ip_network(
+    n = ipaddress.ip_network(
         sys.argv[1],
         strict=False
     )
 
-    if net.version != 4:
-        raise ValueError
+    raise SystemExit(
+        0 if n.version == 4 else 1
+    )
 
 except Exception:
 
-    sys.exit(1)
-
-sys.exit(0)
+    raise SystemExit(1)
 PY
+
 }
 
 add_asn() {
 
     echo
-    echo "============================================================"
-    echo " ДОБАВИТЬ ASN"
-    echo "============================================================"
+    echo "Добавить ASN"
     echo
 
     read -r -p \
         "ASN через пробел: " values
 
-    for ASN in $values; do
+    for x in $values; do
 
-        ASN="${ASN#AS}"
-        ASN="${ASN#as}"
+        x="${x#AS}"
+        x="${x#as}"
 
-        if [[ "$ASN" =~ ^[0-9]+$ ]]; then
+        if [[ "$x" =~ ^[0-9]+$ ]]; then
 
-            if grep -qx \
-                "$ASN" \
-                "$CUSTOM_ASNS"
-            then
+            if grep -qx "$x" "$A"; then
 
                 echo \
-                    "AS${ASN} уже существует."
+                    "AS${x} уже существует."
 
             else
 
                 echo \
-                    "$ASN" \
-                    >> "$CUSTOM_ASNS"
+                    "$x" \
+                    >> "$A"
 
-                echo -e \
-                    "${GREEN}Добавлен AS${ASN}${NC}"
+                echo \
+                    "Добавлен AS${x}"
 
             fi
 
         else
 
-            echo -e \
-                "${RED}Некорректный ASN: ${ASN}${NC}"
+            echo \
+                "Некорректный ASN: $x"
 
         fi
 
     done
 
     sort -nu \
-        "$CUSTOM_ASNS" \
-        -o "$CUSTOM_ASNS"
+        "$A" \
+        -o "$A"
 
     echo
-    echo "После этого выберите:"
-    echo "  6) Обновить диапазоны"
+    echo \
+        "После этого выберите «Обновить диапазоны»."
 
     pause
 }
@@ -2708,53 +1857,48 @@ add_asn() {
 add_ip() {
 
     echo
-    echo "============================================================"
-    echo " ДОБАВИТЬ IP / CIDR"
-    echo "============================================================"
+    echo "Добавить IP/CIDR"
     echo
 
     read -r -p \
         "IP/CIDR через пробел: " values
 
-    for IP in $values; do
+    for x in $values; do
 
-        if valid_ipv4_or_cidr "$IP"; then
+        if valid_ip "$x"; then
 
-            if grep -qxF \
-                "$IP" \
-                "$CUSTOM_IPS"
-            then
+            if grep -qxF "$x" "$I"; then
 
                 echo \
-                    "$IP уже существует."
+                    "$x уже существует."
 
             else
 
                 echo \
-                    "$IP" \
-                    >> "$CUSTOM_IPS"
+                    "$x" \
+                    >> "$I"
 
-                echo -e \
-                    "${GREEN}Добавлен $IP${NC}"
+                echo \
+                    "Добавлен $x"
 
             fi
 
         else
 
-            echo -e \
-                "${RED}Некорректный IPv4/CIDR: ${IP}${NC}"
+            echo \
+                "Некорректный IPv4/CIDR: $x"
 
         fi
 
     done
 
     sort -u \
-        "$CUSTOM_IPS" \
-        -o "$CUSTOM_IPS"
+        "$I" \
+        -o "$I"
 
     echo
-    echo "После этого выберите:"
-    echo "  6) Обновить диапазоны"
+    echo \
+        "После этого выберите «Обновить диапазоны»."
 
     pause
 }
@@ -2764,33 +1908,23 @@ remove_asn() {
     echo
 
     read -r -p \
-        "ASN для удаления: " ASN
+        "ASN для удаления: " x
 
-    ASN="${ASN#AS}"
-    ASN="${ASN#as}"
-
-    if [[ ! "$ASN" =~ ^[0-9]+$ ]]; then
-
-        echo -e \
-            "${RED}Некорректный ASN.${NC}"
-
-        pause
-        return
-
-    fi
+    x="${x#AS}"
+    x="${x#as}"
 
     grep -vxF \
-        "$ASN" \
-        "$CUSTOM_ASNS" \
-        > "${CUSTOM_ASNS}.tmp" \
+        "$x" \
+        "$A" \
+        > "${A}.tmp" \
         || true
 
     mv \
-        "${CUSTOM_ASNS}.tmp" \
-        "$CUSTOM_ASNS"
+        "${A}.tmp" \
+        "$A"
 
     echo \
-        "AS${ASN} удалён из custom ASN."
+        "AS${x} удалён."
 
     pause
 }
@@ -2800,20 +1934,20 @@ remove_ip() {
     echo
 
     read -r -p \
-        "IP/CIDR для удаления: " IP
+        "IP/CIDR для удаления: " x
 
     grep -vxF \
-        "$IP" \
-        "$CUSTOM_IPS" \
-        > "${CUSTOM_IPS}.tmp" \
+        "$x" \
+        "$I" \
+        > "${I}.tmp" \
         || true
 
     mv \
-        "${CUSTOM_IPS}.tmp" \
-        "$CUSTOM_IPS"
+        "${I}.tmp" \
+        "$I"
 
     echo \
-        "$IP удалён из custom IP."
+        "$x удалён."
 
     pause
 }
@@ -2822,58 +1956,32 @@ show_data() {
 
     clear
 
-    echo -e "${CYAN}"
+    echo
     echo "============================================================"
-    echo " CUSTOM MOBILE FILTER DATA"
+    echo " CUSTOM ASN"
     echo "============================================================"
-    echo -e "${NC}"
+
+    cat "$A"
 
     echo
-    echo "ASN:"
-    echo "------------------------------------------------------------"
+    echo "============================================================"
+    echo " CUSTOM IP/CIDR"
+    echo "============================================================"
 
-    if grep -qve \
-        '^[[:space:]]*$' \
-        "$CUSTOM_ASNS"
-    then
-
-        cat "$CUSTOM_ASNS"
-
-    else
-
-        echo "(пусто)"
-
-    fi
-
-    echo
-    echo "IP/CIDR:"
-    echo "------------------------------------------------------------"
-
-    if grep -qve \
-        '^[[:space:]]*$' \
-        "$CUSTOM_IPS"
-    then
-
-        cat "$CUSTOM_IPS"
-
-    else
-
-        echo "(пусто)"
-
-    fi
+    cat "$I"
 
     pause
 }
 
 update_ranges() {
 
+    clear
+
     echo
-    echo "============================================================"
-    echo " ОБНОВЛЕНИЕ ДИАПАЗОНОВ"
-    echo "============================================================"
+    echo "Обновление диапазонов..."
     echo
 
-    "$UPDATE_SCRIPT"
+    "$U"
 
     pause
 }
@@ -2882,15 +1990,12 @@ while true; do
 
     clear
 
-    echo -e "${CYAN}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║                                                            ║"
-    echo "║              MOBILE FILTER MANAGER                        ║"
-    echo "║                                                            ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
     echo
+    echo "============================================================"
+    echo " MOBILE FILTER MANAGER"
+    echo "============================================================"
+    echo
+
     echo "  1) Добавить ASN"
     echo "  2) Добавить IP/CIDR"
     echo "  3) Удалить ASN"
@@ -2901,9 +2006,9 @@ while true; do
     echo
 
     read -r -p \
-        "Выбор: " choice
+        "Выбор: " c
 
-    case "$choice" in
+    case "$c" in
 
         1)
             add_asn
@@ -2934,9 +2039,8 @@ while true; do
             ;;
 
         *)
-
-            echo -e \
-                "${YELLOW}Неверный выбор.${NC}"
+            echo \
+                "Неверный выбор."
 
             sleep 1
             ;;
@@ -2944,246 +2048,41 @@ while true; do
     esac
 
 done
+MANAGER
+
+    chmod 755 "$MANAGER_SCRIPT"
+
+    cat > "$CRON_FILE" <<EOF
+0 2 * * * root ${UPDATE_SCRIPT} >> ${UPDATE_LOG} 2>&1
 EOF
-
-    chmod +x "$MANAGER_SCRIPT"
-
-    ok \
-        "Создан ${MANAGER_SCRIPT}"
-
-    echo
-}
-
-# ============================================================
-# CRON
-# ============================================================
-
-setup_cron() {
-
-    header "АВТООБНОВЛЕНИЕ"
-
-    if [[ "$MODE" == "docker" ]]; then
-
-        cat > "$CRON_FILE" <<EOF
-0 2 * * * root ${UPDATE_SCRIPT} >> ${LOG_FILE} 2>&1
-EOF
-
-    else
-
-        cat > "$CRON_FILE" <<EOF
-0 2 * * * root ${UPDATE_SCRIPT} >> ${LOG_FILE} 2>&1
-EOF
-
-    fi
 
     chmod 644 "$CRON_FILE"
 
-    ok \
-        "Автообновление: каждый день в 02:00"
-
-    ok \
-        "Лог: ${LOG_FILE}"
-
-    echo
+    ok "Updater: ${UPDATE_SCRIPT}"
+    ok "Manager: ${MANAGER_SCRIPT}"
+    ok "Cron: каждый день в 02:00"
 }
 
 # ============================================================
-# SAVE INSTALLATION
+# Save installation state
 # ============================================================
 
-save_installation() {
+save_state() {
 
-    cat > "$INSTALLATION_CONF" <<EOF
+    cat > "$STATE_FILE" <<EOF
 MODE="${MODE}"
 DOCKER_CONTAINER="${DOCKER_CONTAINER}"
-NGINX_CONFIG="${NGINX_CONFIG}"
+NGINX_CONFIG="${TARGET_FILE}"
+FILTER_CONF="${FILTER_FILE}"
 TARGET_SERVER="${TARGET_SERVER}"
+TARGET_SERVER_DISPLAY="${TARGET_SERVER_DISPLAY}"
 TARGET_LOCATION="${TARGET_LOCATION}"
 IP_SOURCE="${IP_SOURCE}"
 VERSION="${VERSION}"
 INSTALLED_AT="$(date '+%Y-%m-%d %H:%M:%S')"
 EOF
 
-    chmod 600 \
-        "$INSTALLATION_CONF"
-}
-
-# ============================================================
-# FINAL STATUS
-# ============================================================
-
-finish() {
-
-    echo
-    echo -e "${GREEN}"
-    echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║                                                            ║"
-    echo "║                  УСТАНОВКА ЗАВЕРШЕНА                      ║"
-    echo "║                                                            ║"
-    echo "╚════════════════════════════════════════════════════════════╝"
-    echo -e "${NC}"
-
-    echo
-    echo -e "${BOLD}Режим:${NC}"
-
-    if [[ "$MODE" == "docker" ]]; then
-
-        echo \
-            "  Docker Nginx: ${DOCKER_CONTAINER}"
-
-    else
-
-        echo \
-            "  Native Nginx"
-
-    fi
-
-    echo
-
-    echo -e "${BOLD}Выбранный server:${NC}"
-    echo "  ${TARGET_SERVER:-_}"
-
-    echo
-
-    echo -e "${BOLD}Выбранный location:${NC}"
-    echo "  ${TARGET_LOCATION}"
-
-    echo
-
-    echo -e "${BOLD}Конфигурация:${NC}"
-    echo "  ${NGINX_CONFIG}"
-
-    echo
-
-    if [[ -n "$BACKUP_FILE" ]]; then
-
-        echo -e "${BOLD}Backup:${NC}"
-        echo "  ${BACKUP_FILE}"
-
-        echo
-
-    fi
-
-    line
-
-    echo
-
-    echo -e "${BOLD}Управление:${NC}"
-    echo
-
-    echo "  mobile-filter"
-
-    echo
-
-    echo "  Можно позже:"
-    echo "    • добавить IP"
-    echo "    • добавить CIDR"
-    echo "    • добавить ASN"
-    echo "    • удалить IP"
-    echo "    • удалить ASN"
-    echo "    • обновить диапазоны"
-
-    echo
-
-    line
-
-    echo
-
-    echo -e "${BOLD}Файлы:${NC}"
-    echo
-
-    echo "  Custom ASN:"
-    echo "    ${CUSTOM_ASNS}"
-
-    echo
-    echo "  Custom IP:"
-    echo "    ${CUSTOM_IPS}"
-
-    echo
-    echo "  Installation:"
-    echo "    ${INSTALLATION_CONF}"
-
-    echo
-    echo "  Range updater:"
-    echo "    ${UPDATE_SCRIPT}"
-
-    echo
-    echo "  Manager:"
-    echo "    ${MANAGER_SCRIPT}"
-
-    echo
-    echo "  Cron:"
-    echo "    ${CRON_FILE}"
-
-    echo
-
-    line
-
-    echo
-
-    echo -e "${BOLD}Проверка:${NC}"
-    echo
-
-    if [[ "$MODE" == "docker" ]]; then
-
-        echo "  Полный конфиг:"
-        echo "    docker exec -it ${DOCKER_CONTAINER} nginx -T"
-
-        echo
-        echo "  Текущий config:"
-        echo "    docker exec -it ${DOCKER_CONTAINER} cat ${NGINX_CONFIG}"
-
-        echo
-        echo "  Проверка:"
-        echo "    docker exec ${DOCKER_CONTAINER} nginx -t"
-
-    else
-
-        echo "  Полный конфиг:"
-        echo "    nginx -T"
-
-        echo
-        echo "  Текущий config:"
-        echo "    cat ${NGINX_CONFIG}"
-
-        echo
-        echo "  Проверка:"
-        echo "    nginx -t"
-
-    fi
-
-    echo
-
-    line
-
-    echo
-
-    echo -e "${BOLD}Принцип работы:${NC}"
-    echo
-
-    echo "  1. IP клиента определяется из выбранного источника."
-    echo
-    echo "  2. Nginx проверяет IP через geo."
-    echo
-    echo "  3. Разрешённые мобильные сети получают 1."
-    echo
-    echo "  4. Остальные получают 0."
-    echo
-    echo "  5. В выбранном location:"
-    echo
-    echo "       if (\$mobile_filter_allowed = 0) {"
-    echo "           return 403;"
-    echo "       }"
-    echo
-    echo "  6. Существующий proxy_pass остаётся без изменений."
-
-    echo
-
-    line
-
-    echo
-    echo -e "${GREEN}Готово.${NC}"
-    echo
+    chmod 600 "$STATE_FILE"
 }
 
 # ============================================================
@@ -3195,135 +2094,93 @@ main() {
     banner
 
     check_root
-
-    prepare_directories
+    init_files
 
     select_mode
-
     install_dependencies
+    check_docker
 
-    check_docker_container
+    select_target
+    select_ip_source
+    ask_custom
 
-    show_nginx_info
+    backup_current
 
-    # --------------------------------------------------------
-    # Existing installation
-    # --------------------------------------------------------
+    create_filter_file
+    ensure_filter_include
+    generate_ranges
+    patch_target
 
-    if [[ -f "$INSTALLATION_CONF" ]]; then
+    header "ПРОВЕРКА NGINX"
 
-        warn \
-            "На сервере уже найдена установка mobile-filter."
+    if ! nginx_test; then
 
-        echo
+        error \
+            "nginx -t завершился ошибкой."
 
-        echo "Файл:"
-        echo "  ${INSTALLATION_CONF}"
+        rollback
 
-        echo
-
-        read -r -p \
-            "Продолжить и проверить текущую конфигурацию? [Y/n]: " answer
-
-        if [[ "$answer" =~ ^[Nn]$ ]]; then
-
-            echo
-            echo "Отмена."
-            exit 0
-
-        fi
-
-        echo
+        exit 1
 
     fi
 
-    # --------------------------------------------------------
-    # Analyse actual Nginx
-    # --------------------------------------------------------
+    ok "nginx -t: OK"
 
-    select_server
+    nginx_reload
 
-    select_location
+    ok "Nginx перезагружен"
 
-    select_ip_source
+    create_helpers
+    save_state
 
-    # --------------------------------------------------------
-    # User custom IP / ASN
-    # --------------------------------------------------------
+    echo
+    echo -e "${GREEN}"
+    echo "╔════════════════════════════════════════════════════════════╗"
+    echo "║                                                            ║"
+    echo "║                  УСТАНОВКА ЗАВЕРШЕНА                      ║"
+    echo "║                                                            ║"
+    echo "╚════════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
 
-    add_initial_custom_data
+    echo
+    echo "  Режим:     ${MODE}"
 
-    # --------------------------------------------------------
-    # Built-in static networks
-    # --------------------------------------------------------
+    if [[ "$MODE" == "docker" ]]; then
+        echo "  Container: ${DOCKER_CONTAINER}"
+    fi
 
-    install_static_networks
+    echo "  Server:    ${TARGET_SERVER_DISPLAY:-_}"
+    echo "  Location:  ${TARGET_LOCATION}"
+    echo "  Config:    ${TARGET_FILE}"
 
-    # --------------------------------------------------------
-    # Helper scripts
-    # --------------------------------------------------------
+    echo
+    echo "  Управление:"
+    echo "    mobile-filter"
 
-    create_update_script
-
-    create_manager
-
-    # --------------------------------------------------------
-    # Initial database
-    # --------------------------------------------------------
-
-    generate_ranges
-
-    # --------------------------------------------------------
-    # Filter include
-    # --------------------------------------------------------
-
-    check_filter_include
-
-    create_filter_config
-
-    # --------------------------------------------------------
-    # Patch target location
-    # --------------------------------------------------------
+    echo
+    echo "  Проверка:"
 
     if [[ "$MODE" == "docker" ]]; then
 
-        patch_docker
+        echo \
+            "    docker exec -it ${DOCKER_CONTAINER} nginx -T"
+
+        echo \
+            "    docker exec ${DOCKER_CONTAINER} nginx -t"
 
     else
 
-        patch_native
+        echo \
+            "    nginx -T"
+
+        echo \
+            "    nginx -t"
 
     fi
 
-    # --------------------------------------------------------
-    # Validate before reload
-    # --------------------------------------------------------
-
-    validate_config
-
-    # --------------------------------------------------------
-    # Reload
-    # --------------------------------------------------------
-
-    reload_nginx
-
-    # --------------------------------------------------------
-    # Cron
-    # --------------------------------------------------------
-
-    setup_cron
-
-    # --------------------------------------------------------
-    # Save installation
-    # --------------------------------------------------------
-
-    save_installation
-
-    # --------------------------------------------------------
-    # Final screen
-    # --------------------------------------------------------
-
-    finish
+    echo
+    echo -e "${GREEN}Готово.${NC}"
+    echo
 }
 
 main "$@"
