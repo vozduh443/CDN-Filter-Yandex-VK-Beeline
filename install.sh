@@ -936,8 +936,7 @@ select_location() {
 
         [[ "$type" == "LOCATION" ]] || continue
 
-        [[ "$server_number" ==
-            "$SELECTED_SERVER_NUMBER" ]] || continue
+        [[ "$server_number" == "$SELECTED_SERVER_NUMBER" ]] || continue
 
         LOC_NAMES[$count]="$location"
         LOC_PROXIES[$count]="$proxy"
