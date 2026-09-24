@@ -116,7 +116,7 @@ docker exec cdn-nginx nginx -s reload
 Установщик интерактивный, поэтому сначала скачайте файл:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/pwdrs/Yandex-CDN-only-on-Mobile-Whitelist-Bypass/main/install.sh -o install.sh
+curl -sSL https://raw.githubusercontent.com/vozduh443/Yandex-CDN-only-on-Mobile-Whitelist-Bypass/main/install.sh -o install.sh
 ```
 
 Затем запустите:
