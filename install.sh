@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="7.2.0"
+VERSION="7.3.0"
 
 # ============================================================
 # MOBILE CDN FILTER
@@ -50,16 +50,15 @@ FILTER_MARKER="# MOBILE-CDN-FILTER"
 
 MODE=""
 DOCKER_CONTAINER=""
-TARGET_FILE=""
+SCOPE=""
+TARGETS=()
 TARGET_SERVER_DISPLAY=""
-TARGET_SERVER_IDX=""
 TARGET_LOCATION=""
-TARGET_LOCATION_IDX=""
 IP_SOURCE=""
 REPLY_NUM=""
 
 NGINX_DUMP_FILE=""
-BACKUP_TARGET=""
+declare -A FILE_BACKUPS=()
 BACKUP_MAIN=""
 BACKUP_RANGES=""
 BACKUP_FILTER=""
@@ -197,6 +196,9 @@ def find_servers(lines):
         i += 1
     return res
 
+def count_locations(block):
+    return len(re.findall(r"(?m)^[ \t]*location[ \t]+[^{]+\{", block))
+
 def proxy_locations(block):
     res = []
     for lm in re.finditer(r"(?m)^[ \t]*location[ \t]+([^{]+)\{", block):
@@ -248,6 +250,10 @@ for (a, b) in find_servers(lines):
 
     block = "\n".join(lines[a:b + 1])
 
+    # only http servers (stream servers have no location blocks)
+    if count_locations(block) == 0:
+        continue
+
     names = []
     listens = []
     for m in re.finditer(r"(?m)^[ \t]*server_name[ \t]+([^;]+);", block):
@@ -256,12 +262,10 @@ for (a, b) in find_servers(lines):
         listens.append(" ".join(m.group(1).split()))
 
     locs = proxy_locations(block)
-    if not locs:
-        continue
 
     snum += 1
-    print("SERVER|{}|{}|{}|{}|{}".format(
-        snum, s(fname), fidx, s(" ".join(names)), s(", ".join(listens))))
+    print("SERVER|{}|{}|{}|{}|{}|{}".format(
+        snum, s(fname), fidx, s(" ".join(names)), s(", ".join(listens)), len(locs)))
 
     for i, (h, p, _a, _b) in enumerate(locs, 1):
         print("LOCATION|{}|{}|{}|{}".format(snum, i, s(h), s(p)))
@@ -269,8 +273,9 @@ PY
 
 read -r -d '' PY_PATCH <<'PY' || true
 path = sys.argv[1]
-sidx = int(sys.argv[2])
-lidx = int(sys.argv[3])
+mode = sys.argv[2]
+sidx = int(sys.argv[3])
+lidx = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
 with open(path, encoding="utf-8", errors="surrogateescape", newline="") as f:
     text = f.read()
@@ -292,29 +297,59 @@ ss = offs[a]
 se = offs[b] + len(lines[b])
 block = text[ss:se]
 
-locs = [x for x in proxy_locations(block)]
-if lidx < 1 or lidx > len(locs):
-    print("NO_LOCATION")
-    sys.exit(0)
+if mode == "server":
+    if "# MOBILE-CDN-FILTER:server" in block:
+        print("ALREADY")
+        sys.exit(0)
 
-_h, _p, ls, le = locs[lidx - 1]
-loc = block[ls:le]
+    first_nl = block.find("\n")
+    if first_nl == -1:
+        print("BAD_SERVER")
+        sys.exit(0)
 
-if "$mobile_cdn_filter_allowed" in loc:
-    print("ALREADY")
-    sys.exit(0)
+    indent = "    "
+    for l in block.split("\n")[1:]:
+        if l.strip() and l.strip() != "}":
+            ind = re.match(r"^([ \t]*)", l).group(1)
+            if ind:
+                indent = ind
+            break
 
-m = re.search(r"(?m)^([ \t]*)proxy_pass\b", loc)
-indent = m.group(1) if m else "    "
+    inj = (
+        indent + "# MOBILE-CDN-FILTER:server\n" +
+        indent + "if ($mobile_cdn_filter_block) {\n" +
+        indent + "    return 403;\n" +
+        indent + "}\n\n"
+    )
 
-inj = (
-    indent + "if ($mobile_cdn_filter_allowed = 0) {\n" +
-    indent + "    return 403;\n" +
-    indent + "}\n\n"
-)
+    new_block = block[:first_nl + 1] + inj + block[first_nl + 1:]
 
-new_loc = loc[:m.start()] + inj + loc[m.start():]
-new_block = block[:ls] + new_loc + block[le:]
+else:
+    locs = proxy_locations(block)
+    if lidx < 1 or lidx > len(locs):
+        print("NO_LOCATION")
+        sys.exit(0)
+
+    _h, _p, ls, le = locs[lidx - 1]
+    loc = block[ls:le]
+
+    if "$mobile_cdn_filter_" in loc:
+        print("ALREADY")
+        sys.exit(0)
+
+    m = re.search(r"(?m)^([ \t]*)proxy_pass\b", loc)
+    indent = m.group(1) or "    "
+
+    inj = (
+        indent + "# MOBILE-CDN-FILTER:location\n" +
+        indent + "if ($mobile_cdn_filter_block) {\n" +
+        indent + "    return 403;\n" +
+        indent + "}\n\n"
+    )
+
+    new_loc = loc[:m.start()] + inj + loc[m.start():]
+    new_block = block[:ls] + new_loc + block[le:]
+
 new_text = text[:ss] + new_block + text[se:]
 
 with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as f:
@@ -332,7 +367,8 @@ with open(p, encoding="utf-8", errors="surrogateescape", newline="") as f:
     t = f.read()
 
 n = re.sub(
-    r"[ \t]*if[ \t]*\(\$mobile_cdn_filter_allowed[ \t]*=[ \t]*0\)[ \t]*\{[ \t]*\r?\n"
+    r"(?:[ \t]*# MOBILE-CDN-FILTER:(?:server|location)[ \t]*\r?\n)?"
+    r"[ \t]*if[ \t]*\(\$mobile_cdn_filter_(?:allowed[ \t]*=[ \t]*0|block)\)[ \t]*\{[ \t]*\r?\n"
     r"[ \t]*return[ \t]+403;[ \t]*\r?\n"
     r"[ \t]*\}[ \t]*\r?\n(?:[ \t]*\r?\n)?",
     "",
@@ -549,8 +585,8 @@ strip_all_injections() {
     local files f real tmp res seen=" "
 
     files="$( {
-        c_exec grep -RlF 'mobile_cdn_filter_allowed' /etc/nginx 2>/dev/null ||
-        c_exec grep -rlF 'mobile_cdn_filter_allowed' /etc/nginx 2>/dev/null ||
+        c_exec grep -RlF 'mobile_cdn_filter_' /etc/nginx 2>/dev/null ||
+        c_exec grep -rlF 'mobile_cdn_filter_' /etc/nginx 2>/dev/null ||
         true
     } )"
 
@@ -562,7 +598,7 @@ strip_all_injections() {
         real="$(c_exec readlink -f "$f" 2>/dev/null || echo "$f")"
 
         case "$real" in
-            "$FILTER_FILE"|"$MOBILE_RANGES"|*.mobile-filter-backup.*)
+            "$FILTER_FILE"|"$MOBILE_RANGES"|*.mobile-filter-backup.*|*/mobile-filter-debug.conf)
                 continue
                 ;;
         esac
@@ -608,7 +644,7 @@ preflight_nginx() {
             continue
         fi
 
-        if grep -qF '"mobile_cdn_filter_allowed" variable' <<< "$out"; then
+        if grep -qE 'unknown "mobile_cdn_[a-z_]+" variable' <<< "$out"; then
             warn "Найдены остатки фильтра без объявления переменной"
             strip_all_injections
             continue
@@ -638,7 +674,36 @@ save_nginx_dump() {
     fi
 }
 
-select_target() {
+
+select_scope() {
+    header "ОБЛАСТЬ ФИЛЬТРАЦИИ"
+
+    echo
+    echo "  1) Весь server: все location (рекомендуется)"
+    echo "  2) Только один location"
+    echo
+
+    local c
+
+    while true; do
+        read -r -p "  Выберите [1-2, по умолчанию 1]: " c
+        c="${c:-1}"
+        case "$c" in
+            1) SCOPE="server"; break ;;
+            2) SCOPE="location"; break ;;
+            *) error "Введите 1 или 2." ;;
+        esac
+    done
+
+    echo
+    if [[ "$SCOPE" == "server" ]]; then
+        ok "Весь server (все location)"
+    else
+        ok "Один location"
+    fi
+}
+
+select_targets() {
     header "АНАЛИЗ ТЕКУЩЕЙ КОНФИГУРАЦИИ"
 
     save_nginx_dump
@@ -648,51 +713,90 @@ select_target() {
 ${PY_PARSE}" "$NGINX_DUMP_FILE")" ||
         die "Не удалось разобрать вывод nginx -T."
 
-    local -a S_NO=() S_FILE=() S_FIDX=() S_NAMES=()
-    local count=0 type a b c d e
+    local -a S_NO=() S_FILE=() S_FIDX=() S_NAMES=() S_NPROXY=()
+    local count=0 type a b c d e f
 
-    while IFS='|' read -r type a b c d e; do
+    while IFS='|' read -r type a b c d e f; do
         [[ "$type" == "SERVER" ]] || continue
 
         S_NO[count]="$a"
         S_FILE[count]="$b"
         S_FIDX[count]="$c"
         S_NAMES[count]="$d"
+        S_NPROXY[count]="${f:-0}"
 
         echo
         echo -e "  ${WHITE}$((count + 1)))${NC} server_name: ${d:-_}"
         echo "     listen:      ${e:-_}"
+        echo "     proxy_pass location: ${f:-0}"
         echo -e "     config:      ${GRAY}${b}${NC}"
 
         count=$((count + 1))
     done <<< "$parsed"
 
-    (( count > 0 )) ||
-        die "Не найдено ни одного server с location, где есть proxy_pass."
+    (( count > 0 )) || die "Не найдено ни одного http server-блока с location."
+
+    local -a sel=()
+    local v i
 
     echo
-    ask_number "$count" "Выберите server"
 
-    local idx=$((REPLY_NUM - 1))
-    local snum="${S_NO[$idx]}"
-    local raw_file="${S_FILE[$idx]}"
+    if [[ "$SCOPE" == "server" ]]; then
+        if (( count == 1 )); then
+            sel=(0)
+            ok "Единственный server выбран автоматически."
+        else
+            while true; do
+                read -r -p "  Выберите server [1-${count}, a = все]: " v
+                if [[ "$v" =~ ^[Aa]$ ]]; then
+                    for (( i = 0; i < count; i++ )); do
+                        sel+=("$i")
+                    done
+                    break
+                fi
+                if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1 && v <= count )); then
+                    sel=("$((v - 1))")
+                    break
+                fi
+                error "Неверный выбор."
+            done
+        fi
+    else
+        ask_number "$count" "Выберите server"
+        sel=("$((REPLY_NUM - 1))")
+    fi
 
-    [[ -n "$raw_file" ]] || die "Не удалось определить файл конфигурации."
+    TARGETS=()
+    TARGET_SERVER_DISPLAY=""
 
-    TARGET_FILE="$(c_exec readlink -f "$raw_file")" ||
-        die "Не удалось определить путь: ${raw_file}"
-
-    TARGET_SERVER_IDX="${S_FIDX[$idx]}"
-    TARGET_SERVER_DISPLAY="${S_NAMES[$idx]}"
-
+    local real
     echo
-    ok "Server: ${TARGET_SERVER_DISPLAY:-_}"
-    ok "Config: ${TARGET_FILE}"
+
+    for i in "${sel[@]}"; do
+        [[ -n "${S_FILE[$i]}" ]] || die "Не удалось определить файл конфигурации."
+
+        real="$(c_exec readlink -f "${S_FILE[$i]}")" ||
+            die "Не удалось определить путь: ${S_FILE[$i]}"
+
+        TARGETS+=("${real}|${S_FIDX[$i]}|0")
+        TARGET_SERVER_DISPLAY+="${S_NAMES[$i]:-_} "
+
+        ok "Server: ${S_NAMES[$i]:-_}  (${real})"
+    done
+
+    TARGET_SERVER_DISPLAY="${TARGET_SERVER_DISPLAY% }"
+
+    [[ "$SCOPE" == "location" ]] || return 0
+
+    i="${sel[0]}"
+    local snum="${S_NO[$i]}"
+
+    (( S_NPROXY[i] > 0 )) || die "В выбранном server нет location с proxy_pass."
 
     local -a L_NAMES=() L_PROXIES=()
     local lcount=0
 
-    while IFS='|' read -r type a b c d e; do
+    while IFS='|' read -r type a b c d e f; do
         [[ "$type" == "LOCATION" ]] || continue
         [[ "$a" == "$snum" ]] || continue
 
@@ -706,12 +810,10 @@ ${PY_PARSE}" "$NGINX_DUMP_FILE")" ||
         lcount=$((lcount + 1))
     done <<< "$parsed"
 
-    (( lcount > 0 )) || die "В выбранном server нет location с proxy_pass."
-
     echo
     ask_number "$lcount" "Выберите location"
 
-    TARGET_LOCATION_IDX="$REPLY_NUM"
+    TARGETS=("${real}|${S_FIDX[$i]}|${REPLY_NUM}")
     TARGET_LOCATION="${L_NAMES[$((REPLY_NUM - 1))]}"
 
     echo
@@ -837,8 +939,20 @@ backup_current() {
 
     c_exec mkdir -p "$BACKUP_DIR"
 
-    BACKUP_TARGET="${BACKUP_DIR}/$(basename "$TARGET_FILE").${ts}"
-    c_exec cp -L "$TARGET_FILE" "$BACKUP_TARGET"
+    local t f bk n=0
+
+    for t in "${TARGETS[@]}"; do
+        f="${t%%|*}"
+
+        if [[ -n "${FILE_BACKUPS[$f]:-}" ]]; then
+            continue
+        fi
+
+        n=$((n + 1))
+        bk="${BACKUP_DIR}/$(basename "$f").${ts}.${n}"
+        c_exec cp -L "$f" "$bk"
+        FILE_BACKUPS[$f]="$bk"
+    done
 
     if c_exec test -f "$MOBILE_RANGES"; then
         BACKUP_RANGES="${BACKUP_DIR}/mobile-ranges.conf.${ts}"
@@ -1123,6 +1237,20 @@ EOF
             ;;
     esac
 
+    # ACME (Let's Encrypt HTTP-01) is never blocked
+    cat >> "$tmp" <<'EOF'
+
+map $uri $mobile_cdn_acme {
+    default 0;
+    "~^/\.well-known/acme-challenge/" 1;
+}
+
+map "$mobile_cdn_filter_allowed:$mobile_cdn_acme" $mobile_cdn_filter_block {
+    default 0;
+    "0:0" 1;
+}
+EOF
+
     c_exec mkdir -p "$(dirname "$FILTER_FILE")"
     c_write "$tmp" "$FILTER_FILE"
     c_exec chmod 644 "$FILTER_FILE"
@@ -1202,32 +1330,37 @@ PY
 # Patch selected location
 # ============================================================
 
-patch_target() {
+
+patch_targets() {
     header "ВНЕДРЕНИЕ ФИЛЬТРА"
 
-    local tmp result
-    tmp="$(mktemp)"
+    local t f sidx lidx tmp result
 
-    c_exec cat "$TARGET_FILE" > "$tmp"
+    for t in "${TARGETS[@]}"; do
+        IFS='|' read -r f sidx lidx <<< "$t"
 
-    result="$(python3 -c "${PY_COMMON}
-${PY_PATCH}" "$tmp" "$TARGET_SERVER_IDX" "$TARGET_LOCATION_IDX")"
+        tmp="$(mktemp)"
+        c_exec cat "$f" > "$tmp"
 
-    case "$result" in
-        PATCHED)
-            c_write "$tmp" "$TARGET_FILE"
-            rm -f "$tmp"
-            ok "Фильтр внедрён"
-            ;;
-        ALREADY)
-            rm -f "$tmp"
-            ok "Фильтр уже установлен"
-            ;;
-        *)
-            rm -f "$tmp"
-            die "Не удалось внедрить фильтр (${result:-нет ответа})."
-            ;;
-    esac
+        result="$(python3 -c "${PY_COMMON}
+${PY_PATCH}" "$tmp" "$SCOPE" "$sidx" "$lidx")"
+
+        case "$result" in
+            PATCHED)
+                c_write "$tmp" "$f"
+                rm -f "$tmp"
+                ok "Фильтр внедрён: ${f} (server #${sidx} в файле)"
+                ;;
+            ALREADY)
+                rm -f "$tmp"
+                ok "Уже установлен: ${f} (server #${sidx} в файле)"
+                ;;
+            *)
+                rm -f "$tmp"
+                die "Не удалось внедрить фильтр в ${f} (${result:-нет ответа})."
+                ;;
+        esac
+    done
 }
 
 # ============================================================
@@ -1242,9 +1375,10 @@ rollback() {
 
     warn "Выполняется rollback..."
 
-    if [[ -n "$BACKUP_TARGET" ]]; then
-        c_restore "$BACKUP_TARGET" "$TARGET_FILE" >/dev/null 2>&1
-    fi
+    local f
+    for f in "${!FILE_BACKUPS[@]}"; do
+        c_restore "${FILE_BACKUPS[$f]}" "$f" >/dev/null 2>&1
+    done
 
     if [[ -n "$BACKUP_MAIN" ]]; then
         c_restore "$BACKUP_MAIN" "$NGINX_MAIN" >/dev/null 2>&1
@@ -1480,12 +1614,11 @@ save_state() {
     {
         printf 'MODE=%q\n'                  "$MODE"
         printf 'DOCKER_CONTAINER=%q\n'      "$DOCKER_CONTAINER"
-        printf 'NGINX_CONFIG=%q\n'          "$TARGET_FILE"
+        printf 'SCOPE=%q\n'                 "$SCOPE"
+        printf 'TARGETS=%q\n'               "$(IFS=';'; echo "${TARGETS[*]}")"
         printf 'FILTER_CONF=%q\n'           "$FILTER_FILE"
         printf 'TARGET_SERVER_DISPLAY=%q\n' "$TARGET_SERVER_DISPLAY"
-        printf 'TARGET_SERVER_IDX=%q\n'     "$TARGET_SERVER_IDX"
         printf 'TARGET_LOCATION=%q\n'       "$TARGET_LOCATION"
-        printf 'TARGET_LOCATION_IDX=%q\n'   "$TARGET_LOCATION_IDX"
         printf 'IP_SOURCE=%q\n'             "$IP_SOURCE"
         printf 'INSTALLED_VERSION=%q\n'     "$VERSION"
         printf 'INSTALLED_AT=%q\n'          "$(date '+%Y-%m-%d %H:%M:%S')"
@@ -1603,7 +1736,8 @@ main() {
 
     preflight_nginx
 
-    select_target
+    select_scope
+    select_targets
     select_ip_source
     ask_custom
 
@@ -1613,7 +1747,7 @@ main() {
     generate_ranges
     create_filter_file
     ensure_filter_include
-    patch_target
+    patch_targets
 
     header "ПРОВЕРКА NGINX"
 
@@ -1644,8 +1778,12 @@ main() {
         echo "  Container: ${DOCKER_CONTAINER}"
     fi
     echo "  Server:    ${TARGET_SERVER_DISPLAY:-_}"
-    echo "  Location:  ${TARGET_LOCATION}"
-    echo "  Config:    ${TARGET_FILE}"
+    if [[ "$SCOPE" == "server" ]]; then
+        echo "  Область:   весь server (все location)"
+    else
+        echo "  Location:  ${TARGET_LOCATION}"
+    fi
+    echo "  Config:    $(printf '%s\n' "${TARGETS[@]}" | cut -d'|' -f1 | sort -u | tr '\n' ' ')"
     echo "  Backups:   ${BACKUP_DIR}"
 
     echo
